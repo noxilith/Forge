@@ -102,12 +102,15 @@ Removing hyprlang and what only it needed
 directory with files in it, session files in system directories) and asks
 first; `--dry-run` shows the whole plan without changing anything.
 
-## Compilers: nothing to install first
+## Compilers and build tools: nothing to install first
 
-Go and Rust projects need a recent compiler, and the one on your machine may be
-missing, broken or too old. Forge doesn't make you sort that out: when a build
-needs Go or Rust and the machine's doesn't qualify, Forge downloads the
-official release, checks it, and builds with that. gh, for example, needs Go
+Go and Rust projects need a recent compiler, Meson projects need Meson and
+Python, and the ones on your machine may be missing, broken or too old. Forge
+doesn't make you sort that out: when a build needs one of them and the
+machine's doesn't qualify, Forge downloads the official release, checks it, and
+builds with that. "Qualify" means it really works: Python is tested by
+importing the modules builds use, since a system whose interpreter and
+standard library don't match counts as broken. gh, for example, needs Go
 1.27; on a machine with a broken `go`:
 
 ```
@@ -118,26 +121,31 @@ Toolchains
 ```
 
 * **Where it comes from.** Go from `go.dev/dl`, Rust (rustc, cargo, rust-std)
-  from `static.rust-lang.org`, over HTTPS only. The download must match the
-  SHA-256 the publisher lists, or it is deleted and the install stops.
+  from `static.rust-lang.org`, Meson's source from PyPI, and Python from
+  python-build-standalone (relocatable CPython builds), over HTTPS only. The
+  download must match the SHA-256 the publisher lists, or it is deleted and the
+  install stops.
 * **Where it lives.** `$FORGE_ROOT/toolchains/<tool>-<version>/`, a cache Forge
   owns. It is not part of any package, so removing a package never removes it
   and updates don't rebuild things when it changes. Later builds reuse it with no
   network. `forge toolchain list | install go [version] | remove go-1.27.3`.
 * **What the project asks for** is read from its own files: `go.mod` (`go` /
   `toolchain`), `Cargo.toml` (`rust-version`, edition 2024) and
-  `rust-toolchain.toml`. The newest stable release that satisfies it is used.
-  Nightly toolchains are not supported.
+  `rust-toolchain.toml`, `meson.build` (`meson_version`). The newest stable
+  release that satisfies it is used. Nightly toolchains are not supported.
+  Python is added for Meson builds and for recipes that list `python3` under
+  `tools`.
 * **Builds stay sandboxed.** The toolchain is mounted read-only; Go is told
   never to fetch another toolchain (`GOTOOLCHAIN=local`).
 * **Policy**, via `FORGE_TOOLCHAINS`: `auto` (default: the machine's compiler if
   it works and is new enough), `managed` (always Forge's own: the same compiler on
   every machine), `host` (never download; fail with an explanation).
 
-This can't go further than Go and Rust today: compilers can't be built into the
-`forge` program itself, and a Go compiler is built by an older Go, so something
-published has to start the chain. C and C++ builds (gcc, cmake, ninja, make,
-meson) still use the machine's tools.
+This stops at Go, Rust, Meson and Python today: compilers can't be built into
+the `forge` program itself, and a Go compiler is built by an older Go, so
+something published has to start the chain. C and C++ builds (gcc, cmake, ninja,
+make) and the GNU autotools still use the machine's, so a machine whose
+`autoconf` is broken can't build projects that ship no generated `configure`.
 
 **For a distribution that ships Forge**: it needs `git`, `bubblewrap`, `curl`,
 `tar`, `xz` and `cp` at runtime. Toolchains can be preinstalled by unpacking
@@ -208,7 +216,8 @@ NIRI_CONFIG = "{data}/config/niri/config.kdl"
 # args_commands = ["Hyprland"]               # ...for these commands only (default: all)
 ```
 
-`{data}` is `$FORGE_ROOT/data/<package>`. The niri recipe uses this: niri reads
+`{data}` is `$FORGE_ROOT/data/<package>`, and `{dep:NAME}` is the directory of
+the Forge package NAME (for a QML or plugin path, say). The niri recipe uses this: niri reads
 `NIRI_CONFIG` and removes it from its own environment, so programs started
 from niri don't inherit it. The Hyprland recipe passes `--config` instead
 (unverified, like the rest of that recipe).
@@ -415,12 +424,12 @@ sandboxed builds.
 Working: install, remove, list, info, update, upgrade, autoremove, verify,
 clean, search, doctor, and dependencies between Forge packages.
 
-Tested against real projects: fastfetch (CMake), niri (Cargo), and the
-Hyprland libraries hyprutils, hyprlang, hyprwayland-scanner and aquamarine
-(dependency chains, build-only tools, RPATH linking, cascade removal). Taps
-were tested with the real `tap/` directory: installing aquamarine by its
-GitHub URL used the tap's recipe and built its dependencies; fastfetch's URL,
-which no recipe describes, installed with auto-detection.
+Tested against real projects: fastfetch (CMake), niri (Cargo), the GitHub CLI
+(Go, with a Forge-provided toolchain), and the Hyprland libraries (dependency
+chains, build-only tools, RPATH linking, cascade removal). Taps were tested with
+the real recipes repository: installing aquamarine by its GitHub URL used the
+tap's recipe and built its dependencies; fastfetch's URL, which no recipe
+describes, installed with auto-detection.
 
 `forge integrate` is tested end-to-end against a user-writable stand-in
 directory (install, wrapper execution, update, tamper detection, removal).
@@ -429,12 +438,13 @@ checked. niri's session file runs `niri-session`, which the niri recipe does
 not install (it needs a systemd user unit), so `forge integrate niri` will
 refuse with an explanation until that is added.
 
-**Hyprland itself has not been built.** Recipes for it and for hyprcursor and
-hyprgraphics are in Forge-Packages, marked unverified: the machine they were
-developed on lacks some host libraries (libzip, re2, xcb-errors, glaze), and
-Forge reports exactly which are missing before building anything. Install
-those with your package manager, then try `forge install hyprland`; expect
-to adjust the recipe.
+**The recipe set is mostly untested.** Forge-Packages has about 50 recipes (the
+Hyprland family and the libraries it needs, foot, fuzzel, wl-clipboard, grim,
+mako, niri, the GitHub CLI and more). About 35 of them built in my test runs;
+the rest were fixed after failing and never rebuilt, cannot build on the machine
+they were written on, or were never tried. **Hyprland itself has never been
+built.** The status of each recipe is in the Forge-Packages README. If a build
+fails for you, that is the expected way to find the next fix.
 
 Next: multiple installed versions and rollback (the layout supports it), build
 cache, cgroup resource limits, scanning build files to list the host libraries

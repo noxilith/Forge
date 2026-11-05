@@ -1231,7 +1231,7 @@ fn a_missing_go_is_downloaded_verified_and_used_for_the_build() {
     let out = String::from_utf8_lossy(&o.stdout).to_string();
     assert!(o.status.success(), "{out}{}", String::from_utf8_lossy(&o.stderr));
     // The plan says what will be downloaded and why; the download then happens.
-    assert!(out.contains("compiler") && out.contains("go 1.99.1") && out.contains("downloads"), "{out}");
+    assert!(out.contains("toolchain") && out.contains("go 1.99.1") && out.contains("downloads"), "{out}");
     assert!(out.contains("Toolchains") && out.contains("download go 1.99.1"), "{out}");
 
     // The build used Forge's Go (and told it never to fetch another one).
@@ -1359,4 +1359,143 @@ fn rust_toolchains_are_assembled_from_their_components() {
     }
     let run = Command::new(f.linkbin().join("hello")).output().unwrap();
     assert_eq!(String::from_utf8_lossy(&run.stdout).trim(), "built-with-managed-rust");
+}
+
+#[test]
+fn a_missing_meson_is_downloaded_from_a_pypi_style_index_and_used() {
+    let f = fixture(MAKEFILE);
+    let dir = f.repo.parent().unwrap().join("fake-pypi");
+    let top = dir.join("src/meson-1.99.0");
+    fs::create_dir_all(&top).unwrap();
+    fs::write(
+        top.join("meson.py"),
+        r##"#!/usr/bin/env python3
+import os, sys
+a = sys.argv[1:]
+if a[0] == "--version":
+    print("1.99.0")
+elif a[0] == "setup":
+    os.makedirs(a[1], exist_ok=True)
+    open(os.path.join(a[1], "prefix"), "w").write(a[a.index("--prefix") + 1])
+elif a[0] == "compile":
+    pass
+elif a[0] == "install":
+    obj = a[a.index("-C") + 1]
+    dest = os.environ["DESTDIR"] + open(os.path.join(obj, "prefix")).read() + "/bin"
+    os.makedirs(dest, exist_ok=True)
+    p = os.path.join(dest, "hello")
+    open(p, "w").write("#!/bin/sh\necho built-with-managed-meson\n")
+    os.chmod(p, 0o755)
+"##,
+    )
+    .unwrap();
+    let tarball = dir.join("meson-1.99.0.tar.gz");
+    run_ok(Command::new("tar").arg("-czf").arg(&tarball).arg("-C").arg(dir.join("src")).arg("meson-1.99.0"));
+    fs::write(
+        dir.join("index.json"),
+        format!(
+            r#"{{"info":{{"version":"1.99.0"}},"urls":[{{"packagetype":"sdist","filename":"meson-1.99.0.tar.gz","url":"file://{}","size":{},"digests":{{"sha256":"{}"}}}}]}}"#,
+            tarball.display(),
+            fs::metadata(&tarball).unwrap().len(),
+            sha256(&tarball)
+        ),
+    )
+    .unwrap();
+
+    fs::remove_file(f.repo.join("Makefile")).unwrap();
+    fs::write(f.repo.join("meson.build"), "project('hello', 'c', meson_version: '>=1.99')\n").unwrap();
+    commit_all(&f.repo, "meson project");
+    f.ok(&["list"]);
+
+    let index = format!("file://{}/index.json", dir.display());
+    let o = f.forge_with(&["install", &format!("file://{}", f.repo.display()), "--name", "hello"], &[("FORGE_MESON_INDEX", index.as_str())]);
+    let out = String::from_utf8_lossy(&o.stdout).to_string();
+    assert!(o.status.success(), "{out}{}", String::from_utf8_lossy(&o.stderr));
+    assert!(out.contains("meson 1.99.0") && out.contains("downloads"), "{out}");
+    assert!(f.root.join("toolchains/meson-1.99.0/bin/meson").is_file());
+    let run = Command::new(f.linkbin().join("hello")).output().unwrap();
+    assert_eq!(String::from_utf8_lossy(&run.stdout).trim(), "built-with-managed-meson");
+    assert!(f.ok(&["toolchain", "list"]).contains("meson-1.99.0"));
+}
+
+#[test]
+fn meson_builds_use_a_python_that_forge_provides() {
+    let f = fixture(MAKEFILE);
+    let triple = match std::env::consts::ARCH {
+        "x86_64" => "x86_64-unknown-linux-gnu",
+        "aarch64" => "aarch64-unknown-linux-gnu",
+        _ => return,
+    };
+    let dir = f.repo.parent().unwrap().join("fake-python-meson");
+    fs::create_dir_all(&dir).unwrap();
+
+    // A fake python-build-standalone release: bin/python3 just records that it was the one used.
+    let py_bin = dir.join("pysrc/python/bin");
+    fs::create_dir_all(&py_bin).unwrap();
+    fs::write(py_bin.join("python3"), "#!/bin/sh\necho forge-python >> \"$FORGE_OBJ/python-used\" 2>/dev/null\nexec /usr/bin/python3 \"$@\"\n").unwrap();
+    fs::set_permissions(py_bin.join("python3"), fs::Permissions::from_mode(0o755)).unwrap();
+    let py_name = format!("cpython-3.99.0+20261026-{triple}-install_only.tar.gz");
+    let py_tar = dir.join(&py_name);
+    run_ok(Command::new("tar").arg("-czf").arg(&py_tar).arg("-C").arg(dir.join("pysrc")).arg("python"));
+    fs::write(
+        dir.join("python-release.json"),
+        format!(
+            r#"{{"assets":[{{"name":"{py_name}","size":1,"browser_download_url":"file://{}","digest":"sha256:{}"}}]}}"#,
+            py_tar.display(),
+            sha256(&py_tar)
+        ),
+    )
+    .unwrap();
+
+    // A fake PyPI for meson: meson.py is a tiny script run by whatever `python3` is first on PATH.
+    let top = dir.join("mesonsrc/meson-1.99.0");
+    fs::create_dir_all(&top).unwrap();
+    fs::write(
+        top.join("meson.py"),
+        r##"#!/usr/bin/env python3
+import os, sys
+a = sys.argv[1:]
+if a[0] == "setup":
+    os.makedirs(a[1], exist_ok=True)
+    open(os.path.join(a[1], "prefix"), "w").write(a[a.index("--prefix") + 1])
+elif a[0] == "install":
+    obj = a[a.index("-C") + 1]
+    dest = os.environ["DESTDIR"] + open(os.path.join(obj, "prefix")).read() + "/bin"
+    os.makedirs(dest, exist_ok=True)
+    seen = "python-used" in os.listdir(obj)
+    p = os.path.join(dest, "hello")
+    open(p, "w").write("#!/bin/sh\necho forge-python-used=%s\n" % seen)
+    os.chmod(p, 0o755)
+"##,
+    )
+    .unwrap();
+    let m_tar = dir.join("meson-1.99.0.tar.gz");
+    run_ok(Command::new("tar").arg("-czf").arg(&m_tar).arg("-C").arg(dir.join("mesonsrc")).arg("meson-1.99.0"));
+    fs::write(
+        dir.join("meson-index.json"),
+        format!(
+            r#"{{"info":{{"version":"1.99.0"}},"urls":[{{"packagetype":"sdist","filename":"meson-1.99.0.tar.gz","url":"file://{}","size":1,"digests":{{"sha256":"{}"}}}}]}}"#,
+            m_tar.display(),
+            sha256(&m_tar)
+        ),
+    )
+    .unwrap();
+
+    fs::remove_file(f.repo.join("Makefile")).unwrap();
+    fs::write(f.repo.join("meson.build"), "project('hello', 'c')\n").unwrap();
+    commit_all(&f.repo, "meson project");
+    f.ok(&["list"]);
+
+    let (pi, mi) = (format!("file://{}/python-release.json", dir.display()), format!("file://{}/meson-index.json", dir.display()));
+    let env = [("FORGE_PYTHON_INDEX", pi.as_str()), ("FORGE_MESON_INDEX", mi.as_str()), ("FORGE_TOOLCHAINS", "managed")];
+    let o = f.forge_with(&["install", &format!("file://{}", f.repo.display()), "--name", "hello"], &env);
+    let out = String::from_utf8_lossy(&o.stdout).to_string();
+    assert!(o.status.success(), "{out}{}", String::from_utf8_lossy(&o.stderr));
+    assert!(out.contains("python 3.99.0") && out.contains("meson 1.99.0"), "both toolchains are planned:\n{out}");
+    assert!(f.root.join("toolchains/python-3.99.0/bin/python3").is_file());
+    assert!(f.root.join("toolchains/meson-1.99.0/bin/meson").is_file());
+    let run = Command::new(f.linkbin().join("hello")).output().unwrap();
+    assert_eq!(String::from_utf8_lossy(&run.stdout).trim(), "forge-python-used=True", "meson ran under Forge's python");
+    let list = f.ok(&["toolchain", "list"]);
+    assert!(list.contains("python-3.99.0") && list.contains("meson-1.99.0"), "{list}");
 }

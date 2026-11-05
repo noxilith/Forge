@@ -71,7 +71,7 @@ struct Node {
     reason: String,
     source_date_epoch: Option<i64>,
     /// A compiler Forge will provide for this build (and why the machine's won't do).
-    toolchain: Option<(toolchain::Plan, String)>,
+    toolchains: Vec<(toolchain::Plan, String)>,
 }
 
 impl Node {
@@ -240,7 +240,7 @@ impl<'a> Planner<'a> {
         if deps.iter().any(|(n, _)| n == &spec.name) {
             bail!("{} cannot depend on itself", spec.name);
         }
-        let toolchain = self.pick_toolchain(&spec.name, system, &job_dir.join("src"), &recipe)?;
+        let toolchains = self.pick_toolchains(&spec.name, system, &job_dir.join("src"), &recipe)?;
         Ok(Node {
             name: spec.name,
             repo: spec.repo,
@@ -257,7 +257,7 @@ impl<'a> Planner<'a> {
             origin: spec.origin,
             system,
             detected,
-            toolchain,
+            toolchains,
             deps,
             reason,
         })
@@ -265,32 +265,36 @@ impl<'a> Planner<'a> {
 
     /// Does this build need a compiler Forge must provide? The machine's own is
     /// used when it works and is new enough (policy: `FORGE_TOOLCHAINS`).
-    fn pick_toolchain(
+    fn pick_toolchains(
         &self,
         name: &str,
         system: BuildSystem,
         src: &Path,
         recipe: &Recipe,
-    ) -> Result<Option<(toolchain::Plan, String)>> {
+    ) -> Result<Vec<(toolchain::Plan, String)>> {
         let dir = match &recipe.build.subdir {
             Some(s) => src.join(s),
             None => src.to_path_buf(),
         };
-        let Some(req) = toolchain::requirement(system, &dir)? else { return Ok(None) };
         let dirs = if self.flags.sandbox { forge_build::deps::sandbox_path_dirs() } else { forge_core::util::path_dirs() };
-        let problem = toolchain::host_problem(&req, &dirs);
-        let why = match (toolchain::mode(), problem) {
-            (toolchain::Mode::Host, Some(p)) => bail!(
-                "{name} needs {} ({}): {p}. Install it, or unset FORGE_TOOLCHAINS=host to let Forge provide one.",
-                req.tool.name(),
-                req.why
-            ),
-            (toolchain::Mode::Host, None) | (toolchain::Mode::Auto, None) => return Ok(None),
-            (toolchain::Mode::Auto, Some(p)) => p,
-            (toolchain::Mode::Managed, _) => "FORGE_TOOLCHAINS=managed".to_string(),
-        };
-        let plan = toolchain::resolve(self.paths, &req).with_context(|| format!("finding a {} toolchain for {name}", req.tool.name()))?;
-        Ok(Some((plan, why)))
+        let mut out = Vec::new();
+        for req in toolchain::requirements(system, &dir, &recipe.build.tools)? {
+            let problem = toolchain::host_problem(&req, &dirs);
+            let why = match (toolchain::mode(), problem) {
+                (toolchain::Mode::Host, Some(p)) => bail!(
+                    "{name} needs {} ({}): {p}. Install it, or unset FORGE_TOOLCHAINS=host to let Forge provide one.",
+                    req.tool.name(),
+                    req.why
+                ),
+                (toolchain::Mode::Host, None) | (toolchain::Mode::Auto, None) => continue,
+                (toolchain::Mode::Auto, Some(p)) => p,
+                (toolchain::Mode::Managed, _) => "FORGE_TOOLCHAINS=managed".to_string(),
+            };
+            let plan = toolchain::resolve(self.paths, &req)
+                .with_context(|| format!("finding a {} toolchain for {name}", req.tool.name()))?;
+            out.push((plan, why));
+        }
+        Ok(out)
     }
 
     /// Fix every package's version id (it depends on its dependencies' ids).
@@ -436,7 +440,7 @@ impl Plan<'_> {
                 if deps > 0 { format!(" ({deps} {})", if deps == 1 { "dependency" } else { "dependencies" }) } else { String::new() }
             ))
         );
-        let row = |label: &str, value: String| println!("      {} {}", ui::dim(&format!("{label:<8}")), value);
+        let row = |label: &str, value: String| println!("      {} {}", ui::dim(&format!("{label:<9}")), value);
         for (n, cfg) in self.nodes.iter().zip(configs) {
             println!();
             println!("  {} {} {}", ui::bullet(), ui::bold(&n.name), ui::dim(&n.version_id));
@@ -458,7 +462,7 @@ impl Plan<'_> {
                 row("needs", list.join(", "));
             }
             row("runtime", describe_run(&n.recipe.run, &self.paths.root().join("data").join(&n.name)));
-            if let Some((t, why)) = &n.toolchain {
+            for (t, why) in &n.toolchains {
                 let how = if t.cached {
                     "already downloaded".to_string()
                 } else if t.download_bytes() > 0 {
@@ -466,7 +470,7 @@ impl Plan<'_> {
                 } else {
                     format!("downloads from {}", t.tool.source())
                 };
-                row("compiler", format!("{} {} {how}, kept for later builds  {}", t.label(), ui::dot(), ui::dim(&format!("({why})"))));
+                row("toolchain", format!("{} {} {how}, kept for later builds  {}", t.label(), ui::dot(), ui::dim(&format!("({why})"))));
             }
 
             let supplied: Vec<&String> = n
@@ -475,6 +479,7 @@ impl Plan<'_> {
                 .fetch
                 .iter()
                 .chain(&n.recipe.build.steps)
+                .chain(&n.recipe.build.configure_sh)
                 .chain(&n.recipe.install.post)
                 .collect();
             if self.flags.details {
@@ -513,7 +518,7 @@ impl Plan<'_> {
         let mut problems = String::new();
         for (n, cfg) in self.nodes.iter().zip(&configs) {
             let tools = forge_build::build::required_tools(cfg);
-            let provided: Vec<&str> = n.toolchain.as_ref().map(|(t, _)| t.tool.provides().to_vec()).unwrap_or_default();
+            let provided: Vec<&str> = n.toolchains.iter().flat_map(|(t, _)| t.tool.provides().iter().copied()).collect();
             let mut mt = forge_build::deps::missing_tools(&tools, self.flags.sandbox);
             mt.retain(|t| !provided.contains(&t.as_str()));
             let mp = forge_build::deps::missing_pkgconfig(&n.recipe.build.pkgconfig);
@@ -539,7 +544,7 @@ impl Plan<'_> {
         // Compilers Forge provides: downloaded and verified now, after you agreed, and reused later.
         let mut configs = configs;
         let mut ready: BTreeMap<PathBuf, toolchain::Ready> = BTreeMap::new();
-        let wanted: Vec<&toolchain::Plan> = self.nodes.iter().filter_map(|n| n.toolchain.as_ref().map(|(p, _)| p)).collect();
+        let wanted: Vec<&toolchain::Plan> = self.nodes.iter().flat_map(|n| n.toolchains.iter().map(|(p, _)| p)).collect();
         if wanted.iter().any(|p| !p.cached) {
             println!("\n{}", ui::bold("Toolchains"));
         }
@@ -558,9 +563,7 @@ impl Plan<'_> {
             ready.insert(p.dir.clone(), r.with_context(|| format!("getting {}", p.label()))?);
         }
         for (i, n) in self.nodes.iter().enumerate() {
-            if let Some((p, _)) = &n.toolchain {
-                configs[i].toolchains = vec![ready[&p.dir].clone()];
-            }
+            configs[i].toolchains = n.toolchains.iter().map(|(p, _)| ready[&p.dir].clone()).collect();
         }
 
         // Phase 1: build everything. Nothing is installed yet.
@@ -606,7 +609,7 @@ impl Plan<'_> {
                 build_deps: forge_build::build::required_tools(cfg)
                     .into_iter()
                     .chain(n.recipe.build.pkgconfig.iter().map(|p| format!("pkgconfig:{p}")))
-                    .chain(n.toolchain.iter().map(|(p, _)| format!("toolchain:{}-{}", p.tool.name(), p.version)))
+                    .chain(n.toolchains.iter().map(|(p, _)| format!("toolchain:{}-{}", p.tool.name(), p.version)))
                     .collect(),
                 explicit: n.explicit,
                 run: n.recipe.run.clone(),
@@ -825,7 +828,7 @@ fn preflight(paths: &Paths, name: &str, recipe: &Recipe, installed: &BTreeMap<St
             tools.extend(forge_build::backends::base_tools(sys));
         }
         // Go and Rust may be provided by Forge itself, so their absence isn't a problem.
-        let provided: &[&str] = if toolchain::mode() == toolchain::Mode::Host { &[] } else { &["go", "cargo", "rustc"] };
+        let provided: &[&str] = if toolchain::mode() == toolchain::Mode::Host { &[] } else { &["go", "cargo", "rustc", "meson", "python3", "python"] };
         for t in forge_build::deps::missing_tools(&tools, flags.sandbox).into_iter().filter(|t| !provided.contains(&t.as_str())) {
             problems += &format!("  {n}: tool {t}\n");
         }

@@ -210,13 +210,8 @@ impl Store {
         }
 
         let staged = stage.join(pkgdir.strip_prefix("/").context("package dir is not absolute")?);
-        if !staged.is_dir() {
-            bail!(
-                "the build installed nothing under its prefix ({}). \
-                 Does the project honour PREFIX and DESTDIR?",
-                pkgdir.display()
-            );
-        }
+        // Files installed to absolute paths (say /usr/lib/qt6/...) land outside the prefix. That is
+        // the more useful thing to report, even when the prefix itself ended up empty.
         let outside = scan::staged_outside_prefix(stage, &staged)?;
         if !outside.is_empty() {
             let shown: Vec<_> = outside.iter().take(10).map(|s| format!("  /{s}")).collect();
@@ -224,6 +219,13 @@ impl Store {
                 "the build tried to install files outside its prefix ({} total), refusing:\n{}",
                 outside.len(),
                 shown.join("\n")
+            );
+        }
+        if !staged.is_dir() {
+            bail!(
+                "the build installed nothing under its prefix ({}). \
+                 Does the project honour PREFIX and DESTDIR?",
+                pkgdir.display()
             );
         }
 
@@ -879,7 +881,18 @@ fn plan_exports(
 fn launcher_script(paths: &Paths, name: &str, rel: &str, command: &str, run: &RunSection) -> Result<String> {
     let data = paths.root().join("data").join(name);
     let data_s = data.to_string_lossy().into_owned();
-    let sub = |v: &str| v.replace("{data}", &data_s);
+    // {data} is the package's data directory; {dep:NAME} is where Forge package NAME lives
+    // (through its stable `current` link, so it survives that package being updated).
+    let sub = |v: &str| -> String {
+        let mut out = v.replace("{data}", &data_s);
+        while let Some(i) = out.find("{dep:") {
+            let Some(len) = out[i..].find('}') else { break };
+            let dep = out[i + 5..i + len].to_string();
+            let repl = if validate_name(&dep).is_ok() { paths.current().join(&dep).to_string_lossy().into_owned() } else { String::new() };
+            out.replace_range(i..i + len + 1, &repl);
+        }
+        out
+    };
     let current = paths.current().join(name);
     let iso = run.isolation()?;
 

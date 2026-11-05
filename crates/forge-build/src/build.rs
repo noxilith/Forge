@@ -281,11 +281,25 @@ fn apply_deps(cfg: &BuildConfig, env: &mut Vec<(String, String)>) {
     for d in cfg.deps.iter().filter(|d| d.runtime) {
         runtime_dirs.extend(lib_dirs(&d.prefix));
     }
+    // Link time only: when a shared library of ours was itself linked against another one
+    // (hyprtoolkit -> Abseil), the linker must be able to find that second one to resolve the
+    // first's symbols. Unlike rpath this is not written into the result, so it is safe for
+    // every build system, CMake included.
+    let rpath_link: Vec<String> = cfg
+        .deps
+        .iter()
+        .filter(|d| d.runtime)
+        .flat_map(|d| lib_dirs(&d.prefix))
+        .map(|d| format!("-Wl,-rpath-link,{d}"))
+        .collect();
     match cfg.system {
-        BuildSystem::Cmake => {}
+        BuildSystem::Cmake => prepend_env(env, "LDFLAGS", &rpath_link.join(" "), " "),
         BuildSystem::Cargo => {
-            let flags: Vec<String> =
-                runtime_dirs.iter().map(|d| format!("-C link-arg=-Wl,-rpath,{d}")).collect();
+            let flags: Vec<String> = runtime_dirs
+                .iter()
+                .map(|d| format!("-C link-arg=-Wl,-rpath,{d}"))
+                .chain(rpath_link.iter().map(|f| format!("-C link-arg={f}")))
+                .collect();
             prepend_env(env, "RUSTFLAGS", &flags.join(" "), " ");
         }
         _ => {
@@ -294,6 +308,7 @@ fn apply_deps(cfg: &BuildConfig, env: &mut Vec<(String, String)>) {
                 flags.extend(lib_dirs(&d.prefix).map(|l| format!("-L{l}")));
             }
             flags.extend(runtime_dirs.iter().map(|d| format!("-Wl,-rpath,{d}")));
+            flags.extend(rpath_link);
             prepend_env(env, "LDFLAGS", &flags.join(" "), " ");
         }
     }

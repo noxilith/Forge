@@ -248,7 +248,7 @@ pub fn toolchain_list(paths: &Paths) -> Result<()> {
     }
     println!();
     println!("  {} {}", ui::bullet(), ui::bold("On this machine"));
-    for t in [tc::Tool::Go, tc::Tool::Rust] {
+    for t in [tc::Tool::Go, tc::Tool::Rust, tc::Tool::Meson, tc::Tool::Python] {
         let (ok, what) = host_line(t);
         println!("  {} {what}", if ok { ui::check() } else { ui::warn() });
     }
@@ -328,7 +328,7 @@ pub fn doctor(paths: &Paths) -> Result<()> {
     }
     println!();
     println!("  {} {}  {}", ui::bullet(), ui::bold("Compilers"), ui::dim(&format!("policy: {}", mode_name())));
-    for t in [forge_build::toolchain::Tool::Go, forge_build::toolchain::Tool::Rust] {
+    for t in [forge_build::toolchain::Tool::Go, forge_build::toolchain::Tool::Rust, forge_build::toolchain::Tool::Meson, forge_build::toolchain::Tool::Python] {
         let (ok, what) = host_line(t);
         let kept: Vec<String> = forge_build::toolchain::installed(paths).into_iter().filter(|i| i.tool == t).map(|i| i.name).collect();
         let note = if ok {

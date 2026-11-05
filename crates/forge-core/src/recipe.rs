@@ -23,7 +23,8 @@ pub struct Recipe {
 /// small launcher script for each exported command from this.
 ///
 /// `{data}` in values stands for `$FORGE_ROOT/data/<package>`, a directory
-/// owned by the package and deleted with it.
+/// owned by the package and deleted with it. `{dep:NAME}` stands for the
+/// directory of Forge package NAME (for example a QML or plugin path).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct RunSection {
@@ -133,6 +134,10 @@ pub struct BuildSection {
     /// Extra arguments for the backend's configure/build command.
     #[serde(default)]
     pub configure_args: Vec<String>,
+    /// Like `configure_args`, but each entry is a shell fragment that is NOT quoted, so it may use
+    /// variables and `$(...)`: for options only a test on the build machine can decide.
+    #[serde(default)]
+    pub configure_sh: Vec<String>,
     #[serde(default)]
     pub env: BTreeMap<String, String>,
     /// Forge packages needed only while building (code generators and the

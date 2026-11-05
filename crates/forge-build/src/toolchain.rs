@@ -32,6 +32,8 @@ use std::time::Duration;
 pub enum Tool {
     Go,
     Rust,
+    Meson,
+    Python,
 }
 
 impl Tool {
@@ -39,13 +41,17 @@ impl Tool {
         match self {
             Tool::Go => "go",
             Tool::Rust => "rust",
+            Tool::Meson => "meson",
+            Tool::Python => "python",
         }
     }
     pub fn parse(s: &str) -> Result<Tool> {
         match s {
             "go" => Ok(Tool::Go),
             "rust" | "cargo" | "rustc" => Ok(Tool::Rust),
-            o => bail!("no toolchain called '{o}' (available: go, rust)"),
+            "meson" => Ok(Tool::Meson),
+            "python" | "python3" => Ok(Tool::Python),
+            o => bail!("no toolchain called '{o}' (available: go, rust, meson, python)"),
         }
     }
     /// Executables whose absence this toolchain makes irrelevant.
@@ -53,12 +59,16 @@ impl Tool {
         match self {
             Tool::Go => &["go"],
             Tool::Rust => &["cargo", "rustc"],
+            Tool::Meson => &["meson"],
+            Tool::Python => &["python3", "python"],
         }
     }
     pub fn source(self) -> &'static str {
         match self {
             Tool::Go => "go.dev",
             Tool::Rust => "static.rust-lang.org",
+            Tool::Meson => "pypi.org",
+            Tool::Python => "github.com/astral-sh/python-build-standalone",
         }
     }
 }
@@ -141,8 +151,19 @@ pub fn requirement(system: BuildSystem, src: &Path) -> Result<Option<Requirement
     match system {
         BuildSystem::Go => Ok(go_requirement(&fs::read_to_string(src.join("go.mod")).unwrap_or_default())),
         BuildSystem::Cargo => rust_requirement(src),
+        BuildSystem::Meson => Ok(Some(meson_requirement(&fs::read_to_string(src.join("meson.build")).unwrap_or_default()))),
         _ => Ok(None),
     }
+}
+
+/// Everything the project needs Forge to be able to provide: its main toolchain
+/// plus Python, which Meson (and any recipe listing `python3` as a tool) runs.
+pub fn requirements(system: BuildSystem, src: &Path, recipe_tools: &[String]) -> Result<Vec<Requirement>> {
+    let mut v: Vec<Requirement> = requirement(system, src)?.into_iter().collect();
+    if system == BuildSystem::Meson || recipe_tools.iter().any(|t| t == "python3" || t == "python") {
+        v.push(Requirement { tool: Tool::Python, min: None, why: "the build runs Python".into() });
+    }
+    Ok(v)
 }
 
 pub fn go_requirement(go_mod: &str) -> Option<Requirement> {
@@ -163,6 +184,25 @@ pub fn go_requirement(go_mod: &str) -> Option<Requirement> {
         }
     }
     Some(Requirement { tool: Tool::Go, min, why: if why.is_empty() { "a Go project".into() } else { why } })
+}
+
+/// `project('x', meson_version: '>= 1.3.0')` -> 1.3.0
+pub fn meson_requirement(meson_build: &str) -> Requirement {
+    let min = meson_build.find("meson_version").and_then(|i| {
+        let rest = &meson_build[i..];
+        let end = rest.find(')').unwrap_or(rest.len());
+        let spec = &rest[..end];
+        // The first quoted string after the key, e.g. '>=1.3.0' or ">= 1.1".
+        let q = spec.find(['\'', '"'])?;
+        let body = &spec[q + 1..];
+        let close = body.find(['\'', '"'])?;
+        Version::parse(body[..close].trim_start_matches(|c: char| !c.is_ascii_digit()))
+    });
+    Requirement {
+        tool: Tool::Meson,
+        why: min.as_ref().map(|m| format!("meson.build asks for meson >= {m}")).unwrap_or_else(|| "a Meson project".into()),
+        min,
+    }
 }
 
 fn rust_requirement(src: &Path) -> Result<Option<Requirement>> {
@@ -213,9 +253,19 @@ fn find_in(dirs: &[PathBuf], name: &str) -> Option<PathBuf> {
 
 /// The version of the machine's compiler, if it exists and actually runs.
 pub fn host_version(tool: Tool, dirs: &[PathBuf]) -> Option<Version> {
+    if tool == Tool::Python {
+        // Not just "does it start": import the modules builds rely on, so an install whose
+        // interpreter and standard library don't match (it happens) counts as broken.
+        let path = find_in(dirs, "python3")?;
+        let code = "import array, multiprocessing, sys; print('.'.join(map(str, sys.version_info[:3])))";
+        let out = Command::new(path).args(["-c", code]).stdin(Stdio::null()).stderr(Stdio::null()).output().ok()?;
+        return out.status.success().then(|| Version::parse(&String::from_utf8_lossy(&out.stdout))).flatten();
+    }
     let (exe, arg, idx) = match tool {
         Tool::Go => ("go", "version", 2), // go version go1.27.3 linux/amd64
         Tool::Rust => ("rustc", "--version", 1), // rustc 1.99.1 (hash date)
+        Tool::Meson => ("meson", "--version", 0), // 1.12.1
+        Tool::Python => unreachable!("handled above"),
     };
     let path = find_in(dirs, exe)?;
     let out = Command::new(path).arg(arg).stdin(Stdio::null()).stderr(Stdio::null()).output().ok()?;
@@ -360,6 +410,96 @@ pub fn rust_pick(manifest: &str, target: &str, min: Option<&Version>) -> Result<
     Ok((version, out))
 }
 
+#[derive(Deserialize)]
+struct GhRelease {
+    assets: Vec<GhAsset>,
+}
+#[derive(Deserialize)]
+struct GhAsset {
+    name: String,
+    size: u64,
+    browser_download_url: String,
+    #[serde(default)]
+    digest: Option<String>,
+}
+
+/// The newest stable CPython "install_only" build for `triple` from a python-build-standalone
+/// release. Only assets with a published SHA-256 are considered.
+pub fn python_pick(json: &str, triple: &str, min: Option<&Version>) -> Result<(Version, Download)> {
+    let rel: GhRelease = serde_json::from_str(json).context("reading the python-build-standalone release")?;
+    let suffix = format!("-{triple}-install_only.tar.gz");
+    let mut best: Option<(Version, Download)> = None;
+    for a in &rel.assets {
+        let Some(rest) = a.name.strip_prefix("cpython-") else { continue };
+        if !a.name.ends_with(&suffix) || a.name.contains("freethreaded") {
+            continue;
+        }
+        let ver_s = rest.split('+').next().unwrap_or("");
+        // 3.16.0a1 and friends are pre-releases.
+        if ver_s.chars().any(|c| c.is_ascii_alphabetic()) {
+            continue;
+        }
+        let Some(v) = Version::parse(ver_s) else { continue };
+        let sum = a.digest.as_deref().and_then(|d| d.strip_prefix("sha256:")).unwrap_or("");
+        if sum.len() != 64 || !sum.chars().all(|c| c.is_ascii_hexdigit()) {
+            continue;
+        }
+        if !(a.browser_download_url.starts_with("https://") || a.browser_download_url.starts_with("file://")) {
+            continue;
+        }
+        if min.is_some_and(|m| v < *m) || best.as_ref().is_some_and(|(b, _)| v <= *b) {
+            continue;
+        }
+        best = Some((v, Download { name: a.name.clone(), url: a.browser_download_url.clone(), sha256: sum.to_string(), size: Some(a.size) }));
+    }
+    best.with_context(|| format!("no stable CPython build with a published checksum for {triple}"))
+}
+
+#[derive(Deserialize)]
+struct PypiDoc {
+    info: PypiInfo,
+    urls: Vec<PypiFile>,
+}
+#[derive(Deserialize)]
+struct PypiInfo {
+    version: String,
+}
+#[derive(Deserialize)]
+struct PypiFile {
+    packagetype: String,
+    filename: String,
+    url: String,
+    size: u64,
+    digests: PypiDigests,
+    #[serde(default)]
+    yanked: bool,
+}
+#[derive(Deserialize)]
+struct PypiDigests {
+    sha256: String,
+}
+
+/// The latest Meson release's source tarball, from PyPI's JSON description.
+pub fn meson_pick(json: &str, min: Option<&Version>) -> Result<(Version, Download)> {
+    let doc: PypiDoc = serde_json::from_str(json).context("reading PyPI's description of meson")?;
+    let version = Version::parse(&doc.info.version).context("PyPI gave an unreadable meson version")?;
+    if doc.info.version.chars().any(|c| c.is_ascii_alphabetic()) {
+        bail!("PyPI's newest meson ({}) is a pre-release; refusing it", doc.info.version);
+    }
+    if min.is_some_and(|m| version < *m) {
+        bail!("the newest meson is {version}, older than the {} needed", min.unwrap());
+    }
+    let f = doc
+        .urls
+        .iter()
+        .find(|f| f.packagetype == "sdist" && !f.yanked && f.filename.ends_with(".tar.gz") && f.digests.sha256.len() == 64)
+        .context("PyPI lists no source tarball for meson")?;
+    if !f.url.starts_with("https://") && !f.url.starts_with("file://") {
+        bail!("unexpected download URL {}", f.url);
+    }
+    Ok((version, Download { name: f.filename.clone(), url: f.url.clone(), sha256: f.digests.sha256.clone(), size: Some(f.size) }))
+}
+
 fn toolchains_dir(paths: &Paths) -> PathBuf {
     paths.root().join("toolchains")
 }
@@ -417,6 +557,22 @@ pub fn resolve(paths: &Paths, req: &Requirement) -> Result<Plan> {
             let url = index.unwrap_or_else(|| "https://go.dev/dl/?mode=json".into());
             let json = fetch_text(&url, allow_file).context("fetching the Go release index")?;
             let (v, d) = go_pick(&json, req.min.as_ref(), go_arch()?, &base)?;
+            (v, vec![d])
+        }
+        Tool::Python => {
+            let index = std::env::var("FORGE_PYTHON_INDEX").ok();
+            let allow_file = index.is_some();
+            let url = index.unwrap_or_else(|| "https://api.github.com/repos/astral-sh/python-build-standalone/releases/latest".into());
+            let json = fetch_text(&url, allow_file).context("fetching the python-build-standalone release list")?;
+            let (v, d) = python_pick(&json, rust_target()?, req.min.as_ref())?;
+            (v, vec![d])
+        }
+        Tool::Meson => {
+            let index = std::env::var("FORGE_MESON_INDEX").ok();
+            let allow_file = index.is_some();
+            let url = index.unwrap_or_else(|| "https://pypi.org/pypi/meson/json".into());
+            let json = fetch_text(&url, allow_file).context("fetching PyPI's description of meson")?;
+            let (v, d) = meson_pick(&json, req.min.as_ref())?;
             (v, vec![d])
         }
         Tool::Rust => {
@@ -544,7 +700,9 @@ impl Ready {
         match self.tool {
             // Never let `go` try to fetch another toolchain behind our back.
             Tool::Go => vec![("GOTOOLCHAIN".into(), "local".into())],
-            Tool::Rust => vec![],
+            // The mounted tree is read-only: don't try to write .pyc files into it.
+            Tool::Python => vec![("PYTHONDONTWRITEBYTECODE".into(), "1".into())],
+            Tool::Rust | Tool::Meson => vec![],
         }
     }
 }
@@ -565,6 +723,8 @@ pub fn provision(paths: &Paths, plan: &Plan, spinner: Option<&ui::Spinner>) -> R
         let allow_file = match plan.tool {
             Tool::Go => std::env::var("FORGE_GO_DL").is_ok_and(|b| b.starts_with("file://")),
             Tool::Rust => std::env::var("FORGE_RUST_DIST").is_ok_and(|b| b.starts_with("file://")),
+            Tool::Meson => std::env::var("FORGE_MESON_INDEX").is_ok_and(|b| b.starts_with("file://")),
+            Tool::Python => std::env::var("FORGE_PYTHON_INDEX").is_ok_and(|b| b.starts_with("file://")),
         };
         let unpack = tmp.join("unpack");
         fs::create_dir_all(&unpack)?;
@@ -580,6 +740,21 @@ pub fn provision(paths: &Paths, plan: &Plan, spinner: Option<&ui::Spinner>) -> R
         }
         let tree = match plan.tool {
             Tool::Go => unpack.join("go"),
+            Tool::Python => unpack.join("python"),
+            Tool::Meson => {
+                // The sdist unpacks to meson-<version>/ with a runnable meson.py;
+                // `bin/meson` is a launcher that runs it with the machine's python3.
+                let top = unpack.join(format!("meson-{}", plan.version));
+                if !top.join("meson.py").is_file() {
+                    bail!("the meson source tarball has no meson.py");
+                }
+                fs::create_dir_all(top.join("bin"))?;
+                let launcher = top.join("bin/meson");
+                fs::write(&launcher, format!("#!/bin/sh\nexec python3 {} \"$@\"\n", forge_core::util::sh_quote(&plan.dir.join("meson.py").to_string_lossy())))?;
+                use std::os::unix::fs::PermissionsExt;
+                fs::set_permissions(&launcher, fs::Permissions::from_mode(0o755))?;
+                top
+            }
             Tool::Rust => {
                 // Each component unpacks to <name>-<ver>-<target>/<part>/...; the parts
                 // listed in its `components` file are merged into one prefix.
@@ -602,6 +777,8 @@ pub fn provision(paths: &Paths, plan: &Plan, spinner: Option<&ui::Spinner>) -> R
         let probe = match plan.tool {
             Tool::Go => ["go"],
             Tool::Rust => ["rustc"],
+            Tool::Meson => ["meson"],
+            Tool::Python => ["python3"],
         };
         for p in probe {
             if !tree.join("bin").join(p).is_file() {
@@ -758,5 +935,63 @@ mod tests {
     fn host_problem_messages() {
         let req = Requirement { tool: Tool::Go, min: Some(v("1.27")), why: "go.mod says `go 1.27.0`".into() };
         assert!(host_problem(&req, &[]).unwrap().contains("missing or doesn't run"));
+    }
+
+    #[test]
+    fn meson_requirements_and_pypi_pick() {
+        let r = meson_requirement("project('x', 'c',\n  version: '1.0',\n  meson_version: '>=1.3.0',\n  license: 'MIT')\n");
+        assert_eq!(r.min.unwrap().to_string(), "1.3.0");
+        assert_eq!(meson_requirement("project('x', meson_version : \">= 0.59\")").min.unwrap().to_string(), "0.59");
+        assert!(meson_requirement("project('x', 'c')").min.is_none());
+        // A meson_version mentioned outside project() but after it is not confused with the first match.
+        assert_eq!(meson_requirement("project('x', meson_version: '>= 1.1')\nfoo(meson_version: '>= 9.9')").min.unwrap().to_string(), "1.1");
+
+        let json = format!(
+            r#"{{"info":{{"version":"1.12.1"}},"urls":[
+              {{"packagetype":"bdist_wheel","filename":"meson-1.12.1-py3-none-any.whl","url":"https://files.pythonhosted.org/w","size":1,"digests":{{"sha256":"{h}"}}}},
+              {{"packagetype":"sdist","filename":"meson-1.12.1.tar.gz","url":"https://files.pythonhosted.org/s","size":2,"digests":{{"sha256":"{h}"}}}}]}}"#,
+            h = "f".repeat(64)
+        );
+        let (v, d) = meson_pick(&json, None).unwrap();
+        assert_eq!((v.to_string(), d.name.as_str(), d.url.as_str()), ("1.12.1".to_string(), "meson-1.12.1.tar.gz", "https://files.pythonhosted.org/s"));
+        assert!(meson_pick(&json, Some(&Version::parse("2.0").unwrap())).unwrap_err().to_string().contains("older than"));
+        assert!(meson_pick(&json.replace("1.12.1\"}", "1.13.0rc1\"}"), None).is_err(), "pre-releases are refused");
+        assert!(meson_pick(&json.replace("sdist", "other"), None).is_err());
+        assert!(meson_pick(&json.replace("https://files.pythonhosted.org/s", "http://evil/s"), None).is_err());
+    }
+
+    #[test]
+    fn picks_the_newest_stable_python_with_a_checksum() {
+        let h = "a".repeat(64);
+        let asset = |n: &str, d: Option<&str>| {
+            format!(r#"{{"name":"{n}","size":5,"browser_download_url":"https://github.com/x/{n}","digest":{}}}"#, d.map(|d| format!("\"{d}\"")).unwrap_or("null".into()))
+        };
+        let t = "x86_64-unknown-linux-gnu";
+        let json = format!(
+            r#"{{"assets":[{},{},{},{},{},{},{}]}}"#,
+            asset(&format!("cpython-3.13.18+20261026-{t}-install_only.tar.gz"), Some(&format!("sha256:{h}"))),
+            asset(&format!("cpython-3.15.2+20261026-{t}-install_only.tar.gz"), Some(&format!("sha256:{h}"))),
+            asset(&format!("cpython-3.16.0a1+20261026-{t}-install_only.tar.gz"), Some(&format!("sha256:{h}"))),
+            asset(&format!("cpython-3.15.2+20261026-{t}-install_only_stripped.tar.gz"), Some(&format!("sha256:{h}"))),
+            asset(&format!("cpython-3.15.2+20261026-{t}-freethreaded+pgo-full.tar.zst"), Some(&format!("sha256:{h}"))),
+            asset(&format!("cpython-3.15.9+20261026-{t}-install_only.tar.gz"), None),
+            asset(&format!("cpython-3.15.2+20261026-aarch64-unknown-linux-gnu-install_only.tar.gz"), Some(&format!("sha256:{h}")))
+        );
+        let (v, d) = python_pick(&json, t, None).unwrap();
+        assert_eq!(v.to_string(), "3.15.2", "pre-releases, other variants and checksum-less assets are skipped");
+        assert!(d.name.ends_with("install_only.tar.gz") && d.sha256 == h);
+        assert_eq!(python_pick(&json, t, Some(&Version::parse("3.14").unwrap())).unwrap().0.to_string(), "3.15.2");
+        assert!(python_pick(&json, t, Some(&Version::parse("3.20").unwrap())).is_err());
+        assert!(python_pick(&json, "riscv64-unknown-linux-gnu", None).is_err());
+    }
+
+    #[test]
+    fn python_is_required_for_meson_and_for_recipes_that_list_it() {
+        let d = std::env::temp_dir();
+        let tools = |t: &[&str]| t.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let names = |v: Vec<Requirement>| v.into_iter().map(|r| r.tool.name()).collect::<Vec<_>>();
+        assert_eq!(names(requirements(BuildSystem::Meson, &d, &[]).unwrap()), ["meson", "python"]);
+        assert_eq!(names(requirements(BuildSystem::Cmake, &d, &tools(&["python3"])).unwrap()), ["python"]);
+        assert!(requirements(BuildSystem::Cmake, &d, &tools(&["pkg-config"])).unwrap().is_empty());
     }
 }

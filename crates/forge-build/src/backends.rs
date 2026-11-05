@@ -41,7 +41,7 @@ pub fn base_tools(sys: BuildSystem) -> Vec<String> {
     let t: &[&str] = match sys {
         BuildSystem::Cargo => &["cargo"],
         BuildSystem::Cmake => &["cmake"],
-        BuildSystem::Meson => &["meson", "ninja"],
+        BuildSystem::Meson => &["meson", "ninja", "python3"],
         BuildSystem::Autotools | BuildSystem::Make => &["make"],
         BuildSystem::Go => &["go"],
         BuildSystem::Custom => &[],
@@ -77,6 +77,7 @@ fn args(ctx: &Ctx) -> String {
         .configure_args
         .iter()
         .map(|a| format!(" {}", sh_quote(a)))
+        .chain(ctx.recipe.build.configure_sh.iter().map(|a| format!(" {a}")))
         .collect()
 }
 
@@ -136,7 +137,7 @@ impl Backend for Meson {
         BuildSystem::Meson
     }
     fn tools(&self, _: &Ctx) -> Vec<String> {
-        vec!["meson".into(), "ninja".into()]
+        vec!["meson".into(), "ninja".into(), "python3".into()]
     }
     fn plan(&self, ctx: &Ctx) -> Plan {
         Plan {
@@ -256,5 +257,13 @@ mod tests {
         assert!(p.build[0].contains("'-DX=a b'"));
         assert!(p.build[0].contains("'-DCMAKE_INSTALL_RPATH=/forge/store/x/1/lib;/forge/store/dep/1/lib'"));
         assert_eq!(p.install, vec!["cmake --install \"$FORGE_OBJ\""]);
+    }
+
+    #[test]
+    fn configure_sh_is_appended_unquoted() {
+        let r = Recipe::parse("[build]\nconfigure_args = [\"-Da=b c\"]\nconfigure_sh = [\"-Dp=$(echo x)\"]").unwrap();
+        let ctx = Ctx { recipe: &r, src_host: PathBuf::from("/nonexistent"), have_ninja: false, prefix: PathBuf::from("/p"), rpath_dirs: vec![] };
+        let p = plan_for(BuildSystem::Meson, &ctx);
+        assert!(p.build[0].contains("'-Da=b c' -Dp=$(echo x)"), "{}", p.build[0]);
     }
 }

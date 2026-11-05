@@ -473,7 +473,16 @@ fn run_cmd(e: &Env, name: &str, args: &[&str], envs: &[(&str, &str)]) -> String 
     for (k, v) in envs {
         c.env(k, v);
     }
-    String::from_utf8_lossy(&c.output().unwrap().stdout).to_string()
+    // Executing a script that another test thread still has open for writing fails with
+    // ETXTBSY ("text file busy"); that is a race in the test, so retry it.
+    for _ in 0..50 {
+        match c.output() {
+            Ok(o) => return String::from_utf8_lossy(&o.stdout).to_string(),
+            Err(e) if e.kind() == std::io::ErrorKind::ExecutableFileBusy => std::thread::sleep(std::time::Duration::from_millis(40)),
+            Err(e) => panic!("{e}"),
+        }
+    }
+    panic!("script stayed busy");
 }
 
 #[test]
@@ -686,4 +695,34 @@ fn link_into_repairs_installs_made_without_a_path_link() {
     // Recorded, so removal cleans it up.
     store.remove("hello", false).unwrap();
     assert!(fs::symlink_metadata(linkdir.path().join("hello")).is_err());
+}
+
+#[test]
+fn launcher_values_can_point_at_a_dependency() {
+    let e = env();
+    let mut store = Store::open(&e.paths).unwrap();
+    let prog = "#!/bin/sh\necho \"qml=$QML_IMPORT_PATH\"\n";
+    let stage = make_stage(&e, "app", "1-x", &[("bin/app", prog, 0o755)]);
+    let mut p = np("app", "1-x");
+    p.run = forge_core::RunSection {
+        isolate: Some("none".into()),
+        env: [("QML_IMPORT_PATH".to_string(), "{dep:qt-support}/lib/qt6/qml:{data}/qml".to_string())].into(),
+        ..Default::default()
+    };
+    store.install(p, &stage, None, false).unwrap();
+    let out = run_cmd(&e, "app", &[], &[]);
+    let root = e.paths.root().display();
+    assert_eq!(out.trim(), format!("qml={root}/current/qt-support/lib/qt6/qml:{root}/data/app/qml"));
+}
+
+#[test]
+fn files_installed_outside_the_prefix_are_reported_even_when_the_prefix_is_empty() {
+    let e = env();
+    let mut store = Store::open(&e.paths).unwrap();
+    let stage = tempfile::Builder::new().tempdir_in(&e.stage).unwrap().keep();
+    fs::create_dir_all(stage.join("usr/lib/qt6/qml/x")).unwrap();
+    fs::write(stage.join("usr/lib/qt6/qml/x/qmldir"), "module x").unwrap();
+    let err = format!("{:#}", store.install(np("p", "1-x"), &stage, None, false).unwrap_err());
+    assert!(err.contains("outside its prefix") && err.contains("/usr/lib/qt6/qml/x/qmldir"), "{err}");
+    assert!(!err.contains("installed nothing"), "{err}");
 }

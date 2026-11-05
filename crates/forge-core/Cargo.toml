@@ -1,0 +1,12 @@
+[package]
+name = "forge-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+anyhow = "1.0.104"
+libc = "0.2.191"
+serde = { version = "1.0.229", features = ["derive"] }
+sha2 = "0.11.1"
+toml = "1.2.0"

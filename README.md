@@ -439,3 +439,7 @@ to adjust the recipe.
 Next: multiple installed versions and rollback (the layout supports it), build
 cache, cgroup resource limits, scanning build files to list the host libraries
 a project needs.
+
+## License
+
+MIT. See [LICENSE](LICENSE).

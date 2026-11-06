@@ -24,7 +24,7 @@ use std::process::{Command, Stdio};
 pub const DEFAULT_URL: &str = "https://github.com/noxilith/Forge-Packages/releases/download/binaries";
 
 /// The official signing key (hex). Empty until one is generated with `forge binary keygen`.
-pub const OFFICIAL_PUBKEY: &str = "";
+pub const OFFICIAL_PUBKEY: &str = "b06947939f5122106df42741ec28be0a3d8fc54016c1f3e39badb4ec83972e50";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Meta {

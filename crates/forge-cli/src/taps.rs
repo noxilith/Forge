@@ -7,10 +7,10 @@
 //!
 //! A repository is a git repo with two recipe directories:
 //! * `recipes/`: recipes written and kept up by hand
-//! * `void/`: recipes generated from Void Linux's package templates (`forge import void`)
+//! * `foundry/`: recipes generated from Void Linux's package templates (`forge-import void`)
 //!
 //! A recipe is `<name>.toml`, or `<name>/recipe.toml` next to its `patches/`.
-//! Lookup order: your own recipes, then each repository's `recipes/`, then its `void/`.
+//! Lookup order: your own recipes, then each repository's `recipes/`, then its `foundry/`.
 //! A git URL that a recipe describes uses that recipe, so `forge build
 //! https://github.com/YaLTeR/niri` gives the same result as `forge install niri`.
 
@@ -25,10 +25,10 @@ use std::process::Command;
 pub const DEFAULT_REPO: &str = "https://github.com/noxilith/Forge-Packages";
 
 /// Recipe directories inside a repository, in priority order.
-const SUBDIRS: [&str; 2] = ["recipes", "void"];
+const SUBDIRS: [&str; 2] = ["recipes", "foundry"];
 
 pub struct Entry {
-    /// `"local"`, or the repository's name (with `/void` for imported recipes).
+    /// `"local"`, or the repository's name (with `/foundry` for imported recipes).
     pub source: String,
     pub name: String,
     pub file: PathBuf,
@@ -167,7 +167,7 @@ fn add_impl(paths: &Paths, source: &str, name: Option<&str>, announce: bool) -> 
     let total: usize = counts.iter().map(|c| c.1).sum();
     if total == 0 {
         let _ = rm_rf(&dest);
-        bail!("{source} has no recipes (expected recipes/<name>.toml or void/<name>.toml)");
+        bail!("{source} has no recipes (expected recipes/<name>.toml or foundry/<name>.toml)");
     }
     println!();
     println!("  {} Added '{name}' with {total} recipes", ui::check());
@@ -245,7 +245,7 @@ pub fn counts(paths: &Paths) -> Result<Vec<(String, usize, usize)>> {
     let mut out = Vec::new();
     for t in tap_names(paths)? {
         let root = taps_dir(paths).join(&t);
-        out.push((t, list_recipes(&root.join("recipes")).len(), list_recipes(&root.join("void")).len()));
+        out.push((t, list_recipes(&root.join("recipes")).len(), list_recipes(&root.join("foundry")).len()));
     }
     Ok(out)
 }

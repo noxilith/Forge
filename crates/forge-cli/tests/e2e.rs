@@ -1512,7 +1512,7 @@ const GREET_INSTALL: &str = "set -e\nD=\"$FORGE_STAGE$FORGE_PREFIX\"\nmkdir -p \
 const GREET_PATCH: &str = "--- a/greet.sh\n+++ b/greet.sh\n@@ -1 +1 @@\n-echo plain\n+echo patched\n";
 
 /// A repository (used as FORGE_REPO) holding an archive recipe with a patch, plus a
-/// same-named recipe under void/ that must lose against recipes/.
+/// same-named recipe under foundry/ that must lose against recipes/.
 fn archive_repo(f: &Fixture) -> (PathBuf, Vec<(&'static str, String)>) {
     let parent = f.repo.parent().unwrap().to_path_buf();
     let src = parent.join("greet-1.0");
@@ -1534,8 +1534,8 @@ fn archive_repo(f: &Fixture) -> (PathBuf, Vec<(&'static str, String)>) {
         &[
             ("recipes/greet/recipe.toml", &recipe),
             ("recipes/greet/patches/fix.patch", GREET_PATCH),
-            ("void/greet.toml", &void_recipe),
-            ("void/other.toml", &void_recipe.replace("\"greet\"", "\"other\"")),
+            ("foundry/greet.toml", &void_recipe),
+            ("foundry/other.toml", &void_recipe.replace("\"greet\"", "\"other\"")),
         ],
     );
     (repo, vec![("FORGE_ALLOW_FILE_SOURCES", "1".to_string())])
@@ -1552,7 +1552,7 @@ fn install_takes_names_from_the_default_repository_and_applies_archive_patches()
     let url = repo.to_str().unwrap().to_string();
     let e: Vec<(&str, &str)> = envs.iter().map(|(k, v)| (*k, v.as_str())).chain([("FORGE_REPO", url.as_str())]).collect();
 
-    // First use sets the repository up by itself; recipes/ wins over void/.
+    // First use sets the repository up by itself; recipes/ wins over foundry/.
     let o = f.forge_with(&["install", "greet"], &e);
     assert!(o.status.success(), "{}{}", String::from_utf8_lossy(&o.stdout), String::from_utf8_lossy(&o.stderr));
     assert_eq!(run_bin(&f, "greet"), "patched");

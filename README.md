@@ -339,11 +339,11 @@ of recipes, in two directories:
 
 * `recipes/`: written and kept up by hand (niri, the Hyprland family, foot, the
   GitHub CLI, ...).
-* `void/`: generated from [Void Linux](https://voidlinux.org)'s package
+* `foundry/`: generated from [Void Linux](https://voidlinux.org)'s package
   templates by `forge-import`, so Forge's catalogue follows Void's. About 5,200
   of Void's 9,700 templates convert (those with one https source archive and a
   CMake, Meson, Cargo, Go, Autotools or Make build); the rest are listed with
-  reasons in `void/REPORT.md`. These recipes have **not been built**.
+  reasons in `foundry/REPORT.md`. These recipes have **not been built**.
 
 A recipe is `<name>.toml`, or `<name>/recipe.toml` next to a `patches/` directory.
 Besides a git `repo`, a recipe can name a release `archive` with a mandatory
@@ -360,7 +360,7 @@ forge tap add <git-url>    # another repository with the same layout
 none), for your own distribution's or a mirror.
 
 * Lookup order: `$FORGE_ROOT/recipes/` (your own) first, then each repository's
-  `recipes/`, then its `void/`. Dependencies named in a recipe are looked up the
+  `recipes/`, then its `foundry/`. Dependencies named in a recipe are looked up the
   same way, so a hand-written recipe always beats an imported one.
 * An update normally uses the recipe saved when the package was installed, so a
   tap change never alters installed packages silently; `--refresh-recipe` opts in.

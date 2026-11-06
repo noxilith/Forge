@@ -66,13 +66,14 @@ impl Fixture {
     }
     fn forge_with(&self, args: &[&str], envs: &[(&str, &str)]) -> Output {
         let mut c = Command::new(env!("CARGO_BIN_EXE_forge"));
-        c.envs(envs.iter().copied());
         c.env("FORGE_ROOT", &self.root)
+            .env("FORGE_REPO", "")
             .env("FORGE_WAYLAND_SESSIONS_DIR", self.sessions())
             .env("FORGE_XSESSIONS_DIR", self.root.parent().unwrap().join("xsessions"))
             .env("FORGE_LINK_DIR", self.linkbin()) // never the real ~/.local/bin
             .args(args);
-        if matches!(args[0], "install" | "update" | "upgrade" | "integrate" | "unintegrate") {
+        c.envs(envs.iter().copied());
+        if matches!(args[0], "install" | "build" | "update" | "upgrade" | "integrate" | "unintegrate") {
             c.arg("--yes");
             if !self.sandbox {
                 c.arg("--insecure-no-sandbox");
@@ -138,7 +139,7 @@ fn install_run_update_remove() {
     f.ok(&["list"]); // creates the layout
     let before = installed_state(&f.root);
 
-    let out = f.ok(&["install", f.repo_str(), "--name", "hello"]);
+    let out = f.ok(&["build", f.repo_str(), "--name", "hello"]);
     assert!(out.contains("Installed hello 1.0.0-"), "{out}");
     assert!(out.contains("auto-detected") && out.contains("make"), "{out}");
 
@@ -152,7 +153,7 @@ fn install_run_update_remove() {
     assert!(f.ok(&["verify"]).contains("intact"));
 
     // Installing twice is refused; update with nothing new is a no-op.
-    assert!(f.fails(&["install", f.repo_str(), "--name", "hello"]).contains("already installed"));
+    assert!(f.ok(&["build", f.repo_str(), "--name", "hello"]).contains("already installed"));
     assert!(f.ok(&["update", "hello"]).contains("up to date"));
 
     // New commit -> update replaces the old version.
@@ -180,19 +181,19 @@ fn pinned_revisions() {
     fs::write(f.repo.join("hello.sh"), "#!/bin/sh\necho hello-v2\n").unwrap();
     commit_all(&f.repo, "v2");
 
-    f.ok(&["install", f.repo_str(), "--name", "hello", "--rev", "v1.0.0"]);
+    f.ok(&["build", f.repo_str(), "--name", "hello", "--rev", "v1.0.0"]);
     let run = Command::new(f.root.join("bin/hello")).output().unwrap();
     assert_eq!(String::from_utf8_lossy(&run.stdout), "hello-v1\n");
     // A tag-pinned package stays on its tag when updated.
     assert!(f.ok(&["update", "hello"]).contains("up to date"));
     f.ok(&["remove", "hello"]);
 
-    assert!(f.fails(&["install", f.repo_str(), "--name", "hello", "--rev", "nonexistent"]).contains("resolving revision"));
+    assert!(f.fails(&["build", f.repo_str(), "--name", "hello", "--rev", "nonexistent"]).contains("resolving revision"));
 
     // A recipe-pinned commit that does not match is rejected before building.
     let recipe = f.root.parent().unwrap().join("pin.toml");
     fs::write(&recipe, "[package]\ncommit = \"deadbeef\"\n").unwrap();
-    let err = f.fails(&["install", f.repo_str(), "--name", "hello", "--recipe", recipe.to_str().unwrap()]);
+    let err = f.fails(&["build", f.repo_str(), "--name", "hello", "--recipe", recipe.to_str().unwrap()]);
     assert!(err.contains("commit mismatch"), "{err}");
     assert!(installed_state(&f.root).is_empty() || !f.root.join("bin/hello").exists());
 }
@@ -206,7 +207,7 @@ fn build_that_writes_outside_its_prefix_is_rejected() {
     let f = fixture(&evil);
     f.ok(&["list"]);
     let before = installed_state(&f.root);
-    let err = f.fails(&["install", f.repo_str(), "--name", "hello"]);
+    let err = f.fails(&["build", f.repo_str(), "--name", "hello"]);
     assert!(err.contains("outside its prefix") && err.contains("/etc/evil.conf"), "{err}");
     assert_eq!(installed_state(&f.root), before);
     assert!(f.ok(&["list"]).contains("no packages"));
@@ -217,7 +218,7 @@ fn failed_build_installs_nothing() {
     let f = fixture("all:\n\tfalse\ninstall:\n\ttrue\n");
     f.ok(&["list"]);
     let before = installed_state(&f.root);
-    let err = f.fails(&["install", f.repo_str(), "--name", "hello"]);
+    let err = f.fails(&["build", f.repo_str(), "--name", "hello"]);
     assert!(err.contains("step failed"), "{err}");
     assert_eq!(installed_state(&f.root), before);
 }
@@ -235,7 +236,7 @@ steps = ['mkdir -p "$FORGE_STAGE$FORGE_PREFIX/bin"', 'cp hello.sh "$FORGE_STAGE$
     )
     .unwrap();
     commit_all(&f.repo, "recipe");
-    let out = f.ok(&["install", f.repo_str(), "--name", "hello"]);
+    let out = f.ok(&["build", f.repo_str(), "--name", "hello"]);
     assert!(out.contains("forge.toml in the repository") && out.contains("custom"), "{out}");
     let run = Command::new(f.root.join("bin/say-hello")).output().unwrap();
     assert_eq!(String::from_utf8_lossy(&run.stdout), "hello-v1\n");
@@ -248,7 +249,7 @@ fn undetectable_project_needs_a_recipe() {
     let f = fixture("");
     fs::remove_file(f.repo.join("Makefile")).unwrap();
     commit_all(&f.repo, "no build system");
-    let err = f.fails(&["install", f.repo_str(), "--name", "hello"]);
+    let err = f.fails(&["build", f.repo_str(), "--name", "hello"]);
     assert!(err.contains("could not detect a build system"), "{err}");
 }
 
@@ -257,7 +258,7 @@ fn missing_host_tool_is_reported_before_building() {
     let f = fixture(MAKEFILE);
     let recipe = f.root.parent().unwrap().join("tools.toml");
     fs::write(&recipe, "[build]\ntools = [\"definitely-not-a-real-tool\"]\npkgconfig = [\"no-such-lib >= 9\"]\n").unwrap();
-    let err = f.fails(&["install", f.repo_str(), "--name", "hello", "--recipe", recipe.to_str().unwrap()]);
+    let err = f.fails(&["build", f.repo_str(), "--name", "hello", "--recipe", recipe.to_str().unwrap()]);
     assert!(err.contains("hello: tool definitely-not-a-real-tool") && err.contains("hello: pkg-config no-such-lib"), "{err}");
 }
 
@@ -293,7 +294,7 @@ steps = [
     )
     .unwrap();
     commit_all(&f.repo, "sandbox probe");
-    let out = f.forge(&["install", f.repo_str(), "--name", "probe", "--recipe", recipe.to_str().unwrap()]);
+    let out = f.forge(&["build", f.repo_str(), "--name", "probe", "--recipe", recipe.to_str().unwrap()]);
     assert!(
         out.status.success(),
         "{}{}",
@@ -573,7 +574,7 @@ fn wm_fixture(install_script: &str) -> Fixture {
     fs::write(f.repo.join("version.txt"), "v1").unwrap();
     fs::write(f.repo.join("forge.toml"), "[build]\nsteps = [\"sh install.sh\"]\n").unwrap();
     commit_all(&f.repo, "wm");
-    f.ok(&["install", f.repo_str(), "--name", "wm"]);
+    f.ok(&["build", f.repo_str(), "--name", "wm"]);
     f
 }
 
@@ -687,6 +688,7 @@ fn integrate_requires_an_installed_package_and_valid_overrides() {
     let wm = wm_fixture(&wm_install_script(WM_DESKTOP));
     let o = Command::new(env!("CARGO_BIN_EXE_forge"))
         .env("FORGE_ROOT", &wm.root)
+        .env("FORGE_REPO", "")
         .env("FORGE_WAYLAND_SESSIONS_DIR", "/usr")
         .env("FORGE_LINK_DIR", "")
         .args(["integrate", "wm", "--yes"])
@@ -723,7 +725,7 @@ fn run_probe(f: &Fixture) -> String {
 #[test]
 fn programs_keep_their_files_inside_the_package_by_default() {
     let f = probe_fixture("");
-    let out = f.ok(&["install", f.repo_str(), "--name", "probe"]);
+    let out = f.ok(&["build", f.repo_str(), "--name", "probe"]);
     assert!(out.contains("config, data, cache and state kept in"), "{out}");
     let data = f.root.join("data/probe");
 
@@ -742,7 +744,7 @@ fn programs_keep_their_files_inside_the_package_by_default() {
     // --keep-data keeps the user's files (e.g. to reinstall later); a plain removal deletes them.
     f.ok(&["remove", "probe", "--yes", "--keep-data"]);
     assert!(data.join("config/probe/settings").exists() && !f.root.join("bin/probe").exists());
-    f.ok(&["install", f.repo_str(), "--name", "probe"]);
+    f.ok(&["build", f.repo_str(), "--name", "probe"]);
     assert!(run_probe(&f).starts_with("cfg="), "reinstalled package picks its old data up again");
     assert_eq!(fs::read_to_string(data.join("config/probe/settings")).unwrap().trim(), "written");
     let out = f.ok(&["remove", "probe", "--yes"]);
@@ -754,14 +756,14 @@ fn programs_keep_their_files_inside_the_package_by_default() {
 #[test]
 fn isolation_can_be_turned_off_and_updates_keep_user_files() {
     let f = probe_fixture("");
-    f.ok(&["install", f.repo_str(), "--name", "probe", "--isolate", "none"]);
+    f.ok(&["build", f.repo_str(), "--name", "probe", "--isolate", "none"]);
     assert_eq!(fs::read_link(f.root.join("bin/probe")).unwrap(), Path::new("../current/probe/bin/probe"));
     assert!(run_probe(&f).starts_with("cfg=unset"));
     assert!(!f.root.join("data").exists());
     f.ok(&["remove", "probe"]);
 
     // Default isolation survives updates, along with what the program wrote.
-    f.ok(&["install", f.repo_str(), "--name", "probe"]);
+    f.ok(&["build", f.repo_str(), "--name", "probe"]);
     run_probe(&f);
     fs::write(f.root.join("data/probe/config/user.conf"), "mine").unwrap();
     fs::write(f.repo.join("note.txt"), "x").unwrap();
@@ -787,7 +789,7 @@ EXTRA = "{data}/config/probe/main.conf"
 "config/probe/main.conf" = "share/probe/default.conf"
 "#,
     );
-    let out = f.ok(&["install", f.repo_str(), "--name", "probe"]);
+    let out = f.ok(&["build", f.repo_str(), "--name", "probe"]);
     assert!(out.contains("environment left alone; sets EXTRA; default files: config/probe/main.conf"), "{out}");
     let data = f.root.join("data/probe");
     let out = run_probe(&f);
@@ -806,7 +808,7 @@ EXTRA = "{data}/config/probe/main.conf"
 fn an_invalid_isolation_setting_is_rejected_before_building() {
     let f = probe_fixture("[run]\nisolate = \"sometimes\"\n");
     f.ok(&["list"]);
-    let err = f.fails(&["install", f.repo_str(), "--name", "probe"]);
+    let err = f.fails(&["build", f.repo_str(), "--name", "probe"]);
     assert!(err.contains("run.isolate"), "{err}");
     assert!(f.ok(&["list"]).contains("no packages"));
 }
@@ -854,29 +856,29 @@ fn a_git_url_described_by_a_tap_uses_the_tap_recipe_and_its_dependencies() {
     let before = installed_state(&f.root);
 
     let out = f.ok(&["tap", "add", t.tap.to_str().unwrap(), "--name", "mytap"]);
-    assert!(out.contains("Added tap 'mytap' with 2 recipes"), "{out}");
+    assert!(out.contains("Added 'mytap' with 2 recipes"), "{out}");
     let listing = f.ok(&["tap", "list"]);
-    assert!(listing.contains("mytap") && listing.contains("2 recipes") && listing.contains("app, base"), "{listing}");
+    assert!(listing.contains("mytap") && listing.contains("2 curated"), "{listing}");
     let found = f.ok(&["search", "app"]);
-    assert!(found.contains("[mytap]"), "{found}");
+    assert!(found.lines().any(|l| l.trim_start().starts_with("app")), "{found}");
 
     // Installing by URL picks up the recipe, including its dependency on `base`.
-    let out = f.ok(&["install", &t.app_url]);
-    assert!(out.contains("Using the recipe 'app' from tap 'mytap'"), "{out}");
+    let out = f.ok(&["build", &t.app_url]);
+    assert!(out.contains("Using the recipe 'app' from 'mytap'"), "{out}");
     assert!(out.contains("dependency of app") && out.contains("Installed base"), "{out}");
     assert_eq!(run_bin(f, "app"), "app+base-v1");
     f.ok(&["remove", "app"]);
     assert_eq!(installed_state(&f.root), before);
 
     // Other spellings of the same URL match too; by name works as before.
-    f.ok(&["install", &format!("{}/", t.app_url)]);
+    f.ok(&["build", &format!("{}/", t.app_url)]);
     f.ok(&["remove", "app"]);
     f.ok(&["install", "app"]);
     f.ok(&["remove", "app"]);
     assert_eq!(installed_state(&f.root), before);
 
     // --ignore-taps builds the repository with no recipe at all (and here that cannot work).
-    let err = f.fails(&["install", &t.app_url, "--ignore-taps"]);
+    let err = f.fails(&["build", &t.app_url, "--ignore-repo"]);
     assert!(err.contains("could not detect a build system"), "{err}");
 }
 
@@ -889,7 +891,7 @@ fn repositories_no_tap_describes_still_install_on_their_own() {
     commit_all(&f.repo, "real makefile");
     let plain = format!("file://{}", f.repo.display());
     let before = installed_state(&f.root);
-    let out = f.ok(&["install", &plain, "--name", "hello"]);
+    let out = f.ok(&["build", &plain, "--name", "hello"]);
     assert!(out.contains("recipe") && out.contains("auto-detected") && !out.contains("Using the recipe"), "{out}");
     assert!(out.contains("auto-detected") && out.contains("make"), "{out}");
     f.ok(&["remove", "hello"]);
@@ -942,7 +944,7 @@ fn tap_updates_bring_in_recipe_changes_and_refresh_recipe_applies_them_to_update
     fs::write(t.app.join("note.txt"), "y").unwrap();
     commit_all(&t.app, "another commit");
     let out = f.ok(&["update", "app", "--refresh-recipe"]);
-    assert!(out.contains("tap 'mytap'") && out.contains("environment left alone"), "{out}");
+    assert!(out.contains("'mytap'") && out.contains("environment left alone"), "{out}");
     assert!(f.ok(&["verify"]).contains("intact"));
     assert!(f.ok(&["info", "app"]).contains("Isolation    : none"));
 }
@@ -965,9 +967,9 @@ fn tap_management_errors_and_removal() {
 
     f.ok(&["tap", "remove", "good-tap"]);
     assert!(!f.root.join("taps/good-tap").exists());
-    assert!(f.ok(&["tap", "list"]).contains("no taps"));
+    assert!(f.ok(&["tap", "list"]).contains("no repositories"));
     let err = f.fails(&["install", "hello"]);
-    assert!(err.contains("no recipe named 'hello'"), "{err}");
+    assert!(err.contains("no package named 'hello'"), "{err}");
 }
 
 // ---- commands work right after install: linked into a directory already on PATH ----
@@ -977,7 +979,7 @@ fn installed_commands_are_linked_into_the_path_directory_automatically() {
     let f = fixture(MAKEFILE);
     f.ok(&["list"]);
     let link = f.linkbin().join("hello");
-    let out = f.ok(&["install", f.repo_str(), "--name", "hello"]);
+    let out = f.ok(&["build", f.repo_str(), "--name", "hello"]);
     assert!(out.contains(&format!("linked into {}", f.linkbin().display())), "{out}");
 
     // Runnable through the PATH directory straight away.
@@ -1003,7 +1005,7 @@ fn a_users_own_file_in_the_path_directory_is_left_alone() {
     f.ok(&["list"]);
     let mine = f.linkbin().join("hello");
     fs::write(&mine, "mine").unwrap();
-    let o = f.forge(&["install", f.repo_str(), "--name", "hello"]);
+    let o = f.forge(&["build", f.repo_str(), "--name", "hello"]);
     assert!(o.status.success());
     assert!(String::from_utf8_lossy(&o.stderr).contains("not managed by Forge; left alone"));
     assert_eq!(fs::read_to_string(&mine).unwrap(), "mine");
@@ -1018,8 +1020,9 @@ fn linking_can_be_disabled_with_an_empty_link_dir() {
     f.ok(&["list"]);
     let o = Command::new(env!("CARGO_BIN_EXE_forge"))
         .env("FORGE_ROOT", &f.root)
+        .env("FORGE_REPO", "")
         .env("FORGE_LINK_DIR", "")
-        .args(["install", f.repo_str(), "--name", "hello", "--yes"])
+        .args(["build", f.repo_str(), "--name", "hello", "--yes"])
         .arg(if f.sandbox { "--keep-build" } else { "--insecure-no-sandbox" })
         .output()
         .unwrap();
@@ -1036,8 +1039,9 @@ fn relink_repairs_a_package_installed_without_a_path_link() {
     // Installed with linking disabled, as older versions did.
     let o = Command::new(env!("CARGO_BIN_EXE_forge"))
         .env("FORGE_ROOT", &f.root)
+        .env("FORGE_REPO", "")
         .env("FORGE_LINK_DIR", "")
-        .args(["install", f.repo_str(), "--name", "hello", "--yes"])
+        .args(["build", f.repo_str(), "--name", "hello", "--yes"])
         .arg(if f.sandbox { "--keep-build" } else { "--insecure-no-sandbox" })
         .output()
         .unwrap();
@@ -1061,7 +1065,7 @@ fn relink_repairs_a_package_installed_without_a_path_link() {
 fn output_is_plain_text_when_not_on_a_terminal_and_colored_only_on_request() {
     let f = fixture(MAKEFILE);
     f.ok(&["list"]);
-    let out = f.ok(&["install", f.repo_str(), "--name", "hello"]);
+    let out = f.ok(&["build", f.repo_str(), "--name", "hello"]);
     assert!(!out.contains('\x1b'), "no escape codes when output is not a terminal: {out:?}");
     // Compact plan, aligned steps with timings, a summary.
     assert!(out.contains("Installing 1 package"), "{out}");
@@ -1077,10 +1081,11 @@ fn output_is_plain_text_when_not_on_a_terminal_and_colored_only_on_request() {
     // FORGE_COLOR=always colors it even in a pipe; FORGE_ASCII swaps the symbols.
     let colored = Command::new(env!("CARGO_BIN_EXE_forge"))
         .env("FORGE_ROOT", &f.root)
+        .env("FORGE_REPO", "")
         .env("FORGE_LINK_DIR", f.linkbin())
         .env("FORGE_COLOR", "always")
         .env("FORGE_ASCII", "1")
-        .args(["install", f.repo_str(), "--name", "hello", "--yes"])
+        .args(["build", f.repo_str(), "--name", "hello", "--yes"])
         .arg(if f.sandbox { "--keep-build" } else { "--insecure-no-sandbox" })
         .output()
         .unwrap();
@@ -1093,14 +1098,14 @@ fn output_is_plain_text_when_not_on_a_terminal_and_colored_only_on_request() {
 fn details_lists_every_command_and_recipe_commands_are_always_shown() {
     let f = fixture(MAKEFILE);
     f.ok(&["list"]);
-    let default = f.ok(&["install", f.repo_str(), "--name", "hello", "--details"]);
+    let default = f.ok(&["build", f.repo_str(), "--name", "hello", "--details"]);
     assert!(default.contains("make -j") && default.contains("make install"), "{default}");
     f.ok(&["remove", "hello"]);
 
     // Commands supplied by a recipe are the text worth reviewing: shown even without --details.
     let r = f.root.parent().unwrap().join("custom.toml");
     fs::write(&r, "[build]\nsteps = [\"make\", \"make install PREFIX=$FORGE_PREFIX DESTDIR=$FORGE_STAGE\"]\n").unwrap();
-    let out = f.ok(&["install", f.repo_str(), "--name", "hello", "--recipe", r.to_str().unwrap()]);
+    let out = f.ok(&["build", f.repo_str(), "--name", "hello", "--recipe", r.to_str().unwrap()]);
     assert!(out.contains("runs ") && out.contains("$ make install PREFIX=$FORGE_PREFIX"), "{out}");
     assert!(!out.contains("(--details lists every command)") || out.contains("runs"), "{out}");
 }
@@ -1111,8 +1116,9 @@ fn without_yes_a_non_interactive_install_refuses_instead_of_guessing() {
     f.ok(&["list"]);
     let o = Command::new(env!("CARGO_BIN_EXE_forge"))
         .env("FORGE_ROOT", &f.root)
+        .env("FORGE_REPO", "")
         .env("FORGE_LINK_DIR", f.linkbin())
-        .args(["install", f.repo_str(), "--name", "hello"])
+        .args(["build", f.repo_str(), "--name", "hello"])
         .arg(if f.sandbox { "--keep-build" } else { "--insecure-no-sandbox" })
         .stdin(std::process::Stdio::null())
         .output()
@@ -1227,7 +1233,7 @@ fn a_missing_go_is_downloaded_verified_and_used_for_the_build() {
     f.ok(&["list"]);
     let env = with(&rel);
 
-    let o = f.forge_with(&["install", &url, "--name", "hello"], &env);
+    let o = f.forge_with(&["build", &url, "--name", "hello"], &env);
     let out = String::from_utf8_lossy(&o.stdout).to_string();
     assert!(o.status.success(), "{out}{}", String::from_utf8_lossy(&o.stderr));
     // The plan says what will be downloaded and why; the download then happens.
@@ -1246,7 +1252,7 @@ fn a_missing_go_is_downloaded_verified_and_used_for_the_build() {
     // The next build reuses it without any download, even with the "server" gone.
     f.ok(&["remove", "hello", "--yes"]);
     fs::remove_dir_all(&rel.dir).unwrap();
-    let o = f.forge_with(&["install", &url, "--name", "hello"], &env);
+    let o = f.forge_with(&["build", &url, "--name", "hello"], &env);
     let out = String::from_utf8_lossy(&o.stdout).to_string();
     assert!(o.status.success(), "{out}{}", String::from_utf8_lossy(&o.stderr));
     assert!(out.contains("already downloaded") && !out.contains("Toolchains"), "{out}");
@@ -1266,7 +1272,7 @@ fn a_download_with_the_wrong_checksum_is_refused() {
     let Some(rel) = fake_go_release(f.repo.parent().unwrap(), "1.99.1", true) else { return };
     let url = go_project(&f);
     f.ok(&["list"]);
-    let o = f.forge_with(&["install", &url, "--name", "hello"], &with(&rel));
+    let o = f.forge_with(&["build", &url, "--name", "hello"], &with(&rel));
     assert!(!o.status.success());
     let err = String::from_utf8_lossy(&o.stderr);
     assert!(err.contains("checksum mismatch") && err.contains("Not installing it"), "{err}");
@@ -1284,7 +1290,7 @@ fn host_only_policy_never_downloads() {
     f.ok(&["list"]);
     let mut env = with(&rel);
     env.push(("FORGE_TOOLCHAINS", "host"));
-    let o = f.forge_with(&["install", &url, "--name", "hello"], &env);
+    let o = f.forge_with(&["build", &url, "--name", "hello"], &env);
     assert!(!o.status.success());
     let err = String::from_utf8_lossy(&o.stderr);
     assert!(err.contains("needs go") && err.contains("FORGE_TOOLCHAINS=host"), "{err}");
@@ -1350,7 +1356,7 @@ fn rust_toolchains_are_assembled_from_their_components() {
     f.ok(&["list"]);
     let dist_url = format!("file://{}", dist.display());
     let env = [("FORGE_RUST_DIST", dist_url.as_str()), ("FORGE_TOOLCHAINS", "managed")];
-    let o = f.forge_with(&["install", &format!("file://{}", f.repo.display()), "--name", "hello"], &env);
+    let o = f.forge_with(&["build", &format!("file://{}", f.repo.display()), "--name", "hello"], &env);
     let out = String::from_utf8_lossy(&o.stdout).to_string();
     assert!(o.status.success(), "{out}{}", String::from_utf8_lossy(&o.stderr));
     assert!(out.contains("rust 1.99.1") && out.contains("FORGE_TOOLCHAINS=managed"), "{out}");
@@ -1408,7 +1414,7 @@ elif a[0] == "install":
     f.ok(&["list"]);
 
     let index = format!("file://{}/index.json", dir.display());
-    let o = f.forge_with(&["install", &format!("file://{}", f.repo.display()), "--name", "hello"], &[("FORGE_MESON_INDEX", index.as_str())]);
+    let o = f.forge_with(&["build", &format!("file://{}", f.repo.display()), "--name", "hello"], &[("FORGE_MESON_INDEX", index.as_str())]);
     let out = String::from_utf8_lossy(&o.stdout).to_string();
     assert!(o.status.success(), "{out}{}", String::from_utf8_lossy(&o.stderr));
     assert!(out.contains("meson 1.99.0") && out.contains("downloads"), "{out}");
@@ -1488,7 +1494,7 @@ elif a[0] == "install":
 
     let (pi, mi) = (format!("file://{}/python-release.json", dir.display()), format!("file://{}/meson-index.json", dir.display()));
     let env = [("FORGE_PYTHON_INDEX", pi.as_str()), ("FORGE_MESON_INDEX", mi.as_str()), ("FORGE_TOOLCHAINS", "managed")];
-    let o = f.forge_with(&["install", &format!("file://{}", f.repo.display()), "--name", "hello"], &env);
+    let o = f.forge_with(&["build", &format!("file://{}", f.repo.display()), "--name", "hello"], &env);
     let out = String::from_utf8_lossy(&o.stdout).to_string();
     assert!(o.status.success(), "{out}{}", String::from_utf8_lossy(&o.stderr));
     assert!(out.contains("python 3.99.0") && out.contains("meson 1.99.0"), "both toolchains are planned:\n{out}");
@@ -1498,4 +1504,79 @@ elif a[0] == "install":
     assert_eq!(String::from_utf8_lossy(&run.stdout).trim(), "forge-python-used=True", "meson ran under Forge's python");
     let list = f.ok(&["toolchain", "list"]);
     assert!(list.contains("python-3.99.0") && list.contains("meson-1.99.0"), "{list}");
+}
+
+// ---- install by name, build by link, archive sources, the default repository ----
+
+const GREET_INSTALL: &str = "set -e\nD=\"$FORGE_STAGE$FORGE_PREFIX\"\nmkdir -p \"$D/bin\"\n{ echo '#!/bin/sh'; cat greet.sh; } > \"$D/bin/greet\"\nchmod +x \"$D/bin/greet\"\n";
+const GREET_PATCH: &str = "--- a/greet.sh\n+++ b/greet.sh\n@@ -1 +1 @@\n-echo plain\n+echo patched\n";
+
+/// A repository (used as FORGE_REPO) holding an archive recipe with a patch, plus a
+/// same-named recipe under void/ that must lose against recipes/.
+fn archive_repo(f: &Fixture) -> (PathBuf, Vec<(&'static str, String)>) {
+    let parent = f.repo.parent().unwrap().to_path_buf();
+    let src = parent.join("greet-1.0");
+    fs::create_dir_all(&src).unwrap();
+    fs::write(src.join("greet.sh"), "echo plain\n").unwrap();
+    fs::write(src.join("install.sh"), GREET_INSTALL).unwrap();
+    let tarball = parent.join("greet-1.0.tar.gz");
+    assert!(Command::new("tar").args(["-czf"]).arg(&tarball).args(["-C"]).arg(&parent).arg("greet-1.0").status().unwrap().success());
+    let sum = Command::new("sha256sum").arg(&tarball).output().unwrap();
+    let sha = String::from_utf8_lossy(&sum.stdout).split_whitespace().next().unwrap().to_string();
+    let recipe = format!(
+        "[package]\nname = \"greet\"\nversion = \"1.0\"\ndescription = \"curated\"\narchive = \"file://{}\"\nsha256 = \"{sha}\"\nstrip_components = 1\npatches = [\"patches/fix.patch\"]\n[build]\nsteps = [\"sh install.sh\"]\n",
+        tarball.display()
+    );
+    let void_recipe = recipe.replace("curated", "imported").replace("patches = [\"patches/fix.patch\"]\n", "");
+    let repo = make_repo(
+        &parent,
+        "official",
+        &[
+            ("recipes/greet/recipe.toml", &recipe),
+            ("recipes/greet/patches/fix.patch", GREET_PATCH),
+            ("void/greet.toml", &void_recipe),
+            ("void/other.toml", &void_recipe.replace("\"greet\"", "\"other\"")),
+        ],
+    );
+    (repo, vec![("FORGE_ALLOW_FILE_SOURCES", "1".to_string())])
+}
+
+#[test]
+fn install_takes_names_from_the_default_repository_and_applies_archive_patches() {
+    let f = fixture("");
+    if !f.sandbox {
+        eprintln!("skipping: patches are applied inside the sandbox");
+        return;
+    }
+    let (repo, envs) = archive_repo(&f);
+    let url = repo.to_str().unwrap().to_string();
+    let e: Vec<(&str, &str)> = envs.iter().map(|(k, v)| (*k, v.as_str())).chain([("FORGE_REPO", url.as_str())]).collect();
+
+    // First use sets the repository up by itself; recipes/ wins over void/.
+    let o = f.forge_with(&["install", "greet"], &e);
+    assert!(o.status.success(), "{}{}", String::from_utf8_lossy(&o.stdout), String::from_utf8_lossy(&o.stderr));
+    assert_eq!(run_bin(&f, "greet"), "patched");
+    assert!(f.ok(&["verify"]).contains("intact"));
+
+    // An imported recipe is installable too (after greet gives up bin/greet).
+    f.ok(&["remove", "greet"]);
+    let o = f.forge_with(&["install", "other"], &e);
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    let list = String::from_utf8_lossy(&f.forge_with(&["tap", "list"], &e).stdout).into_owned();
+    assert!(list.contains("1 curated") && list.contains("2 imported"), "{list}");
+    f.ok(&["remove", "other"]);
+    assert!(!f.root.join("bin/greet").exists() && !f.root.join("bin/other").exists());
+}
+
+#[test]
+fn install_only_takes_names_and_points_links_to_build() {
+    let f = fixture(MAKEFILE);
+    let err = f.fails(&["install", "https://github.com/user/project"]);
+    assert!(err.contains("forge build"), "{err}");
+    let err = f.fails(&["install", "no-such-package"]);
+    assert!(err.contains("no-such-package"), "{err}");
+    // `forge build` still takes a link (here a local repository).
+    let out = f.ok(&["build", f.repo_str(), "--name", "hello"]);
+    assert!(out.contains("hello"), "{out}");
+    assert_eq!(run_bin(&f, "hello"), "hello-v1");
 }

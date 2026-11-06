@@ -1,0 +1,20 @@
+[package]
+name = "forge-import"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Converts Void Linux package templates into Forge recipes (parses them; never runs them)"
+
+[[bin]]
+name = "forge-import"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1.0.104"
+clap = { version = "4.6.7", features = ["derive"] }
+forge-core = { version = "0.1.0", path = "../forge-core" }
+toml = "1.2.0"
+
+[dev-dependencies]
+tempfile = "3.27.0"

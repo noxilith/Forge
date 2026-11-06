@@ -1,5 +1,6 @@
 //! Fetching sources, planning builds per build system, and running them in a sandbox.
 
+pub mod archive;
 pub mod backends;
 pub mod build;
 pub mod deps;

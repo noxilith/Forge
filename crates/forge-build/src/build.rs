@@ -38,6 +38,21 @@ pub struct BuildConfig {
     pub deps: Vec<DepMount>,
     /// Compilers Forge provided (see `toolchain`), mounted read-only and put first on PATH.
     pub toolchains: Vec<crate::toolchain::Ready>,
+    /// Patch files applied (in order, `-p<patch_strip>`) to the unpacked source before anything else.
+    pub patches: Vec<PathBuf>,
+    pub patch_strip: u32,
+}
+
+/// One shell script that applies the patches, with `patch` or, if the machine has none, `git apply`.
+fn patch_script(strip: u32, files: &[String]) -> String {
+    files
+        .iter()
+        .map(|f| {
+            let q = forge_core::util::sh_quote(f);
+            format!("if command -v patch >/dev/null 2>&1; then patch -Np{strip} -i {q}; else git apply -p{strip} {q}; fi")
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 fn lib_dirs(prefix: &Path) -> [String; 2] {
@@ -95,7 +110,12 @@ fn workdir_host(cfg: &BuildConfig) -> PathBuf {
 /// The commands that will run, per phase, for display before building.
 pub fn describe(cfg: &BuildConfig) -> Vec<(&'static str, Vec<String>)> {
     let plan = backends::plan_for(cfg.system, &ctx_for(cfg));
-    vec![("fetch (network)", plan.fetch), ("build", plan.build), ("install", plan.install)]
+    let mut out = Vec::new();
+    if !cfg.patches.is_empty() {
+        out.push(("patch", vec![format!("apply {} patch file(s) with -p{}", cfg.patches.len(), cfg.patch_strip)]));
+    }
+    out.extend([("fetch (network)", plan.fetch), ("build", plan.build), ("install", plan.install)]);
+    out
 }
 
 /// Run the build. Returns the stage directory: the package is at
@@ -119,11 +139,19 @@ pub fn build(cfg: &BuildConfig) -> Result<PathBuf> {
              (install the dependencies first, or drop --insecure-no-sandbox)"
         );
     }
+    // Where each patch file is, as the build sees it.
+    let patch_inside: Vec<String> = cfg
+        .patches
+        .iter()
+        .enumerate()
+        .map(|(i, f)| if cfg.sandbox { format!("/build/patches/{:03}.patch", i + 1) } else { f.to_string_lossy().into_owned() })
+        .collect();
     let ro_binds: Vec<(PathBuf, String)> = if cfg.sandbox {
         cfg.deps
             .iter()
             .map(|d| (d.host.clone(), d.prefix.to_string_lossy().into_owned()))
             .chain(cfg.toolchains.iter().map(|t| (t.dir.clone(), t.dir.to_string_lossy().into_owned())))
+            .chain(cfg.patches.iter().cloned().zip(patch_inside.iter().cloned()))
             .collect()
     } else {
         Vec::new()
@@ -200,7 +228,10 @@ pub fn build(cfg: &BuildConfig) -> Result<PathBuf> {
 
     let plan = backends::plan_for(cfg.system, &ctx_for(cfg));
     let log = cfg.log();
-    let phases: [(&str, &[String], bool, bool); 3] = [
+    // Patches go first (they may change Cargo.toml and the like), offline, inside the sandbox.
+    let patch_cmds: Vec<String> = if patch_inside.is_empty() { vec![] } else { vec![patch_script(cfg.patch_strip, &patch_inside)] };
+    let phases: [(&str, &[String], bool, bool); 4] = [
+        ("patch", &patch_cmds, false, false),
         ("fetch", &plan.fetch, true, false),
         ("build", &plan.build, false, false),
         ("install", &plan.install, false, true),
@@ -332,6 +363,7 @@ fn step_label(cfg: &BuildConfig, phase: &str, script: &str) -> String {
     }
     let word = script.split_whitespace().next().unwrap_or("");
     match (phase, cfg.system) {
+        ("patch", _) => "apply patches".into(),
         ("fetch", _) => "fetch dependencies".into(),
         ("build", BuildSystem::Cmake | BuildSystem::Meson) if word == "cmake" && script.contains(" -S ") || word == "meson" && script.contains(" setup ") => {
             "configure".into()

@@ -16,6 +16,9 @@ pub struct Recipe {
     pub install: InstallSection,
     #[serde(default)]
     pub run: RunSection,
+    /// Directory the recipe was read from (where `patches` live). Not part of the file.
+    #[serde(skip)]
+    pub base_dir: Option<std::path::PathBuf>,
 }
 
 /// How the installed commands are launched: where the program keeps its
@@ -117,6 +120,28 @@ pub struct PackageSection {
     /// when nothing needs them.
     #[serde(default, alias = "runtime_deps")]
     pub deps: Vec<String>,
+
+    /// A release tarball to build instead of a git repository (give `archive`
+    /// *or* `repo`). `https` only, and the SHA-256 is mandatory: the download
+    /// must match it exactly.
+    pub archive: Option<String>,
+    pub sha256: Option<String>,
+    /// The package's version. Required with `archive` (a git source gets its
+    /// version from its tags).
+    pub version: Option<String>,
+    /// Leading directories to drop when unpacking an archive (default 1, as
+    /// most tarballs wrap everything in one directory).
+    pub strip_components: Option<u32>,
+    /// Patch files, relative to the recipe's directory, applied in order
+    /// (inside the sandbox) before building.
+    #[serde(default)]
+    pub patches: Vec<String>,
+    /// `-p` level for the patches (default 1).
+    pub patch_strip: Option<u32>,
+    /// Shown by `forge search`.
+    pub description: Option<String>,
+    pub homepage: Option<String>,
+    pub license: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
@@ -178,11 +203,77 @@ impl Recipe {
     pub fn from_file(path: &Path) -> Result<Self> {
         let text = std::fs::read_to_string(path)
             .with_context(|| format!("reading recipe {}", path.display()))?;
-        Self::parse(&text).with_context(|| format!("in {}", path.display()))
+        let mut r = Self::parse(&text).with_context(|| format!("in {}", path.display()))?;
+        r.base_dir = path.parent().map(Path::to_path_buf);
+        Ok(r)
+    }
+
+    /// Where the source comes from: the archive URL, else the repository.
+    pub fn source_url(&self) -> Option<&str> {
+        self.package.archive.as_deref().or(self.package.repo.as_deref())
+    }
+
+    /// The patch files, resolved against the recipe's directory and checked to exist.
+    pub fn patch_files(&self) -> Result<Vec<std::path::PathBuf>> {
+        if self.package.patches.is_empty() {
+            return Ok(Vec::new());
+        }
+        let base = self.base_dir.as_deref().context("this recipe lists patches but was not read from a file")?;
+        self.package
+            .patches
+            .iter()
+            .map(|p| {
+                let f = base.join(p);
+                if !f.is_file() {
+                    bail!("patch {} not found next to the recipe", f.display());
+                }
+                Ok(f)
+            })
+            .collect()
     }
 
     pub fn to_toml(&self) -> Result<String> {
         Ok(toml::to_string_pretty(self)?)
+    }
+
+    fn validate_source(&self) -> Result<()> {
+        let p = &self.package;
+        if p.archive.is_some() && p.repo.is_some() {
+            bail!("package.archive and package.repo are alternatives: give one");
+        }
+        if let Some(url) = &p.archive {
+            if !(url.starts_with("https://") || url.starts_with("file://")) {
+                bail!("package.archive must be an https:// URL (got {url})");
+            }
+            match &p.sha256 {
+                Some(h) if h.len() == 64 && h.chars().all(|c| c.is_ascii_hexdigit()) => {}
+                Some(_) => bail!("package.sha256 must be 64 hexadecimal characters"),
+                None => bail!("package.archive needs package.sha256: a download is only accepted if it matches"),
+            }
+            match &p.version {
+                Some(v) => crate::util::validate_version_id(v)?,
+                None => bail!("package.archive needs package.version"),
+            }
+        } else if p.sha256.is_some() || p.strip_components.is_some() {
+            bail!("package.sha256 and package.strip_components only apply to package.archive");
+        }
+        if let Some(n) = p.strip_components {
+            if n > 8 {
+                bail!("package.strip_components {n} is unreasonable");
+            }
+        }
+        if let Some(n) = p.patch_strip {
+            if n > 8 {
+                bail!("package.patch_strip {n} is unreasonable");
+            }
+        }
+        for f in &p.patches {
+            let path = Path::new(f);
+            if f.is_empty() || path.is_absolute() || path.components().any(|c| matches!(c, std::path::Component::ParentDir)) {
+                bail!("package.patches entry '{f}' must be a relative path without '..'");
+            }
+        }
+        Ok(())
     }
 
     fn validate(&self) -> Result<()> {
@@ -190,6 +281,7 @@ impl Recipe {
             crate::util::validate_name(n)?;
         }
         self.run.validate()?;
+        self.validate_source()?;
         for d in self.package.deps.iter().chain(&self.build.deps) {
             crate::util::validate_name(d)?;
         }
@@ -293,5 +385,60 @@ mod run_tests {
         }
         let again = Recipe::parse(&r.to_toml().unwrap()).unwrap();
         assert_eq!(again.run, r.run);
+    }
+}
+
+#[cfg(test)]
+mod source_tests {
+    use super::*;
+
+    const H: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+    #[test]
+    fn archive_sources() {
+        let r = Recipe::parse(&format!(
+            "[package]\nname = \"fmt\"\nversion = \"12.1.0\"\narchive = \"https://github.com/fmtlib/fmt/archive/12.1.0.tar.gz\"\nsha256 = \"{H}\"\npatches = [\"patches/a.patch\"]\ndescription = \"x\"\n[build]\nsystem = \"cmake\"\n"
+        ))
+        .unwrap();
+        assert_eq!(r.source_url(), Some("https://github.com/fmtlib/fmt/archive/12.1.0.tar.gz"));
+        assert_eq!(r.package.patches, vec!["patches/a.patch"]);
+        // A git recipe's source is its repo.
+        assert_eq!(Recipe::parse("[package]\nrepo = \"https://x/y\"").unwrap().source_url(), Some("https://x/y"));
+    }
+
+    #[test]
+    fn archive_sources_are_checked() {
+        let base = format!("name = \"x\"\nversion = \"1.0\"\narchive = \"https://x/y.tar.gz\"\nsha256 = \"{H}\"\n");
+        assert!(Recipe::parse(&format!("[package]\n{base}")).is_ok());
+        for (bad, why) in [
+            (format!("[package]\n{base}repo = \"https://x\"\n"), "both archive and repo"),
+            (format!("[package]\nname = \"x\"\nversion = \"1.0\"\narchive = \"https://x/y.tar.gz\"\n"), "no checksum"),
+            (format!("[package]\nname = \"x\"\nversion = \"1.0\"\narchive = \"https://x/y.tar.gz\"\nsha256 = \"abc\"\n"), "short checksum"),
+            (format!("[package]\nname = \"x\"\narchive = \"https://x/y.tar.gz\"\nsha256 = \"{H}\"\n"), "no version"),
+            (format!("[package]\nname = \"x\"\nversion = \"1.0\"\narchive = \"http://x/y.tar.gz\"\nsha256 = \"{H}\"\n"), "plain http"),
+            (format!("[package]\nname = \"x\"\nversion = \"1.0\"\narchive = \"ftp://x/y\"\nsha256 = \"{H}\"\n"), "ftp"),
+            (format!("[package]\n{base}patches = [\"../evil.patch\"]\n"), "patch escapes"),
+            (format!("[package]\n{base}patches = [\"/etc/passwd\"]\n"), "absolute patch"),
+            ("[package]\nrepo = \"https://x\"\nsha256 = \"abc\"\n".to_string(), "sha256 without archive"),
+        ] {
+            assert!(Recipe::parse(&bad).is_err(), "{why}");
+        }
+    }
+
+    #[test]
+    fn patch_files_are_resolved_next_to_the_recipe() {
+        let d = std::env::temp_dir().join(format!("forge-patchrecipe-{}", std::process::id()));
+        std::fs::create_dir_all(d.join("patches")).unwrap();
+        std::fs::write(d.join("patches/a.patch"), "x").unwrap();
+        std::fs::write(
+            d.join("recipe.toml"),
+            format!("[package]\nname = \"x\"\nversion = \"1\"\narchive = \"https://x/y.tar.gz\"\nsha256 = \"{H}\"\npatches = [\"patches/a.patch\"]\n"),
+        )
+        .unwrap();
+        let r = Recipe::from_file(&d.join("recipe.toml")).unwrap();
+        assert_eq!(r.patch_files().unwrap(), vec![d.join("patches/a.patch")]);
+        std::fs::remove_file(d.join("patches/a.patch")).unwrap();
+        assert!(r.patch_files().unwrap_err().to_string().contains("not found"));
+        std::fs::remove_dir_all(&d).unwrap();
     }
 }

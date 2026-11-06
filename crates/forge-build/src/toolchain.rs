@@ -632,6 +632,11 @@ pub fn sha256_file(path: &Path) -> Result<String> {
     Ok(h.finalize().iter().map(|b| format!("{b:02x}")).collect())
 }
 
+/// Download `d` to `dest` over curl and verify its SHA-256; a mismatch deletes the file and fails.
+pub fn download_verified(d: &Download, dest: &Path, allow_file: bool, spinner: Option<&ui::Spinner>) -> Result<()> {
+    download(d, dest, allow_file, spinner)
+}
+
 fn download(d: &Download, dest: &Path, allow_file: bool, spinner: Option<&ui::Spinner>) -> Result<()> {
     let mut child = Command::new("curl")
         .args(curl_args(&d.url, allow_file)?)

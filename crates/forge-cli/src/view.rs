@@ -172,43 +172,54 @@ pub fn clean(paths: &Paths, all: bool) -> Result<()> {
     Ok(())
 }
 
+/// Most hits shown at once; the rest are counted.
+const SEARCH_LIMIT: usize = 40;
+
 pub fn search(paths: &Paths, query: &str) -> Result<()> {
     let q = query.to_lowercase();
-    let hits: Vec<_> = taps::catalog(paths)?
+    let mut hits: Vec<_> = taps::catalog(paths)?
         .into_iter()
         .filter(|e| {
             e.name.to_lowercase().contains(&q)
-                || e.recipe.package.repo.as_deref().unwrap_or("").to_lowercase().contains(&q)
+                || e.recipe.source_url().unwrap_or("").to_lowercase().contains(&q)
+                || e.recipe.package.description.as_deref().unwrap_or("").to_lowercase().contains(&q)
         })
         .collect();
+    // Exact name first, then names that start with the query, then the rest.
+    hits.sort_by_key(|e| (e.name != q, !e.name.to_lowercase().starts_with(&q), e.name.clone()));
     println!();
     if hits.is_empty() {
-        println!("  no recipes match '{query}'  {}", ui::dim("(any git URL can still be installed directly)"));
+        println!("  no packages match '{query}'  {}", ui::dim("(you can still build from a git link: forge build <link>)"));
         return Ok(());
     }
+    let total = hits.len();
+    hits.truncate(SEARCH_LIMIT);
     let wn = hits.iter().map(|e| e.name.chars().count()).max().unwrap_or(0);
-    let repos: Vec<String> = hits.iter().map(|e| ui::short_url(e.recipe.package.repo.as_deref().unwrap_or(""))).collect();
-    let wr = repos.iter().map(|r| r.chars().count()).max().unwrap_or(0);
-    for (e, repo) in hits.iter().zip(&repos) {
-        println!("  {}  {}  {}", ui::bold(&ui::pad(&e.name, wn)), ui::dim(&ui::pad(repo, wr)), ui::cyan(&format!("[{}]", e.source)));
+    for e in &hits {
+        let version = e.recipe.package.version.clone().unwrap_or_default();
+        println!(
+            "  {}  {}  {}",
+            ui::bold(&ui::pad(&e.name, wn)),
+            ui::pad(&version, 10),
+            ui::dim(&ui::truncate(e.recipe.package.description.as_deref().unwrap_or(&ui::short_url(e.recipe.source_url().unwrap_or(""))), 60))
+        );
+    }
+    if total > hits.len() {
+        println!("\n  {}", ui::dim(&format!("{} more; narrow the search", total - hits.len())));
     }
     Ok(())
 }
 
 pub fn tap_list(paths: &Paths) -> Result<()> {
-    let names = taps::tap_names(paths)?;
+    let counts = taps::counts(paths)?;
     println!();
-    if names.is_empty() {
-        println!("  no taps  {}", ui::dim("(add one with: forge tap add <git-url>)"));
+    if counts.is_empty() {
+        println!("  no repositories  {}", ui::dim("(the Forge package repository is set up on first use; or: forge tap add <git-url>)"));
         return Ok(());
     }
-    let catalog = taps::catalog(paths)?;
-    for n in names {
-        let recipes: Vec<&str> = catalog.iter().filter(|e| e.source == n).map(|e| e.name.as_str()).collect();
-        println!("  {} {}  {}", ui::bullet(), ui::bold(&n), ui::dim(&format!("{} recipe{}", recipes.len(), if recipes.len() == 1 { "" } else { "s" })));
-        if !recipes.is_empty() {
-            println!("      {}", recipes.join(", "));
-        }
+    for (name, curated, imported) in counts {
+        println!("  {} {}", ui::bullet(), ui::bold(&name));
+        println!("      {} curated, {} imported from Void Linux", curated, imported);
     }
     Ok(())
 }

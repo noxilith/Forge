@@ -38,9 +38,23 @@ struct BuildFlags {
 
 #[derive(Subcommand)]
 enum Cmd {
-    /// Build a package from source and install it.
+    /// Install packages by name from the Forge package repository (built from source).
     Install {
-        /// Git URL, path to a local git repository, or a recipe name.
+        /// Package names, e.g. `niri foot`. To build from a git link, use `forge build`.
+        #[arg(required = true)]
+        names: Vec<String>,
+        /// Where the program keeps its files: `xdg` (default; XDG dirs inside the package's data
+        /// directory), `home` (also HOME), or `none` (leave the environment alone).
+        #[arg(long, value_parser = ["xdg", "home", "none"])]
+        isolate: Option<String>,
+        #[command(flatten)]
+        flags: BuildFlags,
+    },
+    /// Refresh the Forge package repository (and any other repositories you added).
+    Sync,
+    /// Build and install software from a git link or a local repository.
+    Build {
+        /// Git URL (https://github.com/user/project) or a path to a local git repository.
         target: String,
         /// Tag, branch or commit to build (default: the default branch).
         #[arg(long)]
@@ -54,9 +68,9 @@ enum Cmd {
         /// Force a build system instead of detecting it.
         #[arg(long)]
         build_system: Option<String>,
-        /// Don't use a recipe from your recipes/taps even if one describes this repository.
-        #[arg(long)]
-        ignore_taps: bool,
+        /// Don't use a recipe from the package repository even if one describes this repository.
+        #[arg(long, alias = "ignore-taps")]
+        ignore_repo: bool,
         /// Where the program keeps its files: `xdg` (default; XDG dirs inside the package's data
         /// directory), `home` (also HOME), or `none` (leave the environment alone).
         #[arg(long, value_parser = ["xdg", "home", "none"])]
@@ -197,9 +211,23 @@ fn real_main() -> Result<()> {
     }
     let paths = Paths::from_env()?;
     match cli.cmd {
-        Cmd::Install { target, rev, name, recipe, build_system, ignore_taps, isolate, flags } => {
+        Cmd::Install { names, isolate, flags } => {
+            taps::ensure_default(&paths)?;
+            install::install_names(&paths, &names, &flags.into(), isolate)
+        }
+        Cmd::Sync => {
+            taps::ensure_default(&paths)?;
+            taps::update(&paths, None)
+        }
+        Cmd::Build { target, rev, name, recipe, build_system, ignore_repo, isolate, flags } => {
+            if !ignore_repo && recipe.is_none() {
+                // Best effort: a missing repository only means no recipe will match this link.
+                if let Err(e) = taps::ensure_default(&paths) {
+                    eprintln!("{} {e:#}", forge_core::ui::warn());
+                }
+            }
             let (repo, recipe, origin, name) =
-                install::resolve_target(&paths, &target, recipe.as_ref(), name.as_deref(), ignore_taps)?;
+                install::resolve_target(&paths, &target, recipe.as_ref(), name.as_deref(), ignore_repo)?;
             let rev_spec = rev.or_else(|| recipe.as_ref().and_then(|r| r.package.rev.clone()));
             install::install(
                 &paths,
@@ -216,9 +244,13 @@ fn real_main() -> Result<()> {
             )
         }
         Cmd::Update { package, refresh_recipe, flags } => {
+            repo_best_effort(&paths);
             install::update(&paths, vec![package], &flags.into(), refresh_recipe)
         }
-        Cmd::Upgrade { refresh_recipe, flags } => install::update(&paths, vec![], &flags.into(), refresh_recipe),
+        Cmd::Upgrade { refresh_recipe, flags } => {
+            repo_best_effort(&paths);
+            install::update(&paths, vec![], &flags.into(), refresh_recipe)
+        }
         Cmd::Tap { cmd } => match cmd {
             TapCmd::Add { source, name } => taps::add(&paths, &source, name.as_deref()),
             TapCmd::Remove { name } => taps::remove(&paths, &name),
@@ -251,7 +283,10 @@ fn real_main() -> Result<()> {
         Cmd::List => view::list(&Store::open(&paths)?),
         Cmd::Info { package } => view::info(&paths, &Store::open(&paths)?, &package),
         Cmd::Clean { all } => view::clean(&paths, all),
-        Cmd::Search { query } => view::search(&paths, &query),
+        Cmd::Search { query } => {
+            repo_best_effort(&paths);
+            view::search(&paths, &query)
+        }
         Cmd::Verify { package } => view::verify(&Store::open(&paths)?, package.as_deref()),
         Cmd::Relink { package } => view::relink(&paths, package),
         Cmd::Toolchain { cmd } => match cmd {
@@ -264,6 +299,13 @@ fn real_main() -> Result<()> {
             println!("export PATH=\"{}:$PATH\"", paths.bin().display());
             Ok(())
         }
+    }
+}
+
+/// Set up the package repository if it is missing; an offline machine just goes on without it.
+fn repo_best_effort(paths: &Paths) {
+    if let Err(e) = taps::ensure_default(paths) {
+        eprintln!("{} {e:#}", forge_core::ui::warn());
     }
 }
 

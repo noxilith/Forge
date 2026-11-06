@@ -7,9 +7,10 @@ and can remove it again without leaving anything it installed behind.
 (Working name; it is likely to change.)
 
 ```
-forge install https://github.com/fastfetch-cli/fastfetch   # any git URL, no repository needed
-forge install niri                 # a name from your recipes or a tap (see "Taps")
-forge tap add <git-url> | list | update | remove <name>
+forge install niri foot            # by name, from the Forge package repository
+forge build https://github.com/fastfetch-cli/fastfetch   # any git link, no recipe needed
+forge sync                         # refresh the package repository
+forge tap add <git-url> | list | update | remove <name>   # more repositories
 forge list | info <pkg> | verify [pkg]
 forge update <pkg> | upgrade
 forge remove <pkg> [--dry-run] [--keep-deps] [--keep-data] | autoremove
@@ -316,35 +317,51 @@ forge unintegrate hyprland
 
 ## Two ways to install
 
-1. **Any git URL, with nothing else.** Forge detects the build system (Cargo,
-   CMake, Meson, Autotools, Go, Make) and builds it. This is the default for
-   small, self-contained projects like fastfetch. No recipe, no repository.
-2. **Recipes, kept in a tap, for packages that need more**: dependencies on
-   other Forge packages (Hyprland and its libraries), or special isolation
-   settings (niri, Hyprland).
+1. **`forge install <name>`: from the Forge package repository.** It takes
+   names only, and only from the repository
+   ([Forge-Packages](https://github.com/noxilith/Forge-Packages), set up
+   automatically the first time you install something). Everything in it is
+   built from source, and its dependencies come from it too.
+2. **`forge build <git link>`: any git repository, with nothing else.** Forge
+   detects the build system (Cargo, CMake, Meson, Autotools, Go, Make) and
+   builds it. Good for small, self-contained projects like fastfetch.
 
-The two meet at the URL: **if a recipe describes the repository you give,
-Forge uses it.** `forge install https://github.com/YaLTeR/niri` (also with
+The two meet at the link: **if the repository has a recipe for that project,
+`forge build` uses it.** `forge build https://github.com/YaLTeR/niri` (also with
 `.git`, `git@github.com:...` or a trailing slash) gives the same result as
-`forge install niri`, including the tap's dependencies. `--ignore-taps` builds
-a URL with auto-detection only, and `--rev` still overrides the recipe's
-revision.
+`forge install niri`, including the dependencies. `--ignore-repo` builds a link
+with auto-detection only, and `--rev` still overrides the recipe's revision.
 
-## Taps
+## The package repository
 
-A tap is a git repository containing `recipes/<name>.toml`. The recipes for
-niri, Hyprland, the Hyprland libraries and the GitHub CLI are in
-[Forge-Packages](https://github.com/noxilith/Forge-Packages).
+[Forge-Packages](https://github.com/noxilith/Forge-Packages) is a git repository
+of recipes, in two directories:
+
+* `recipes/`: written and kept up by hand (niri, the Hyprland family, foot, the
+  GitHub CLI, ...).
+* `void/`: generated from [Void Linux](https://voidlinux.org)'s package
+  templates by `forge-import`, so Forge's catalogue follows Void's. About 5,200
+  of Void's 9,700 templates convert (those with one https source archive and a
+  CMake, Meson, Cargo, Go, Autotools or Make build); the rest are listed with
+  reasons in `void/REPORT.md`. These recipes have **not been built**.
+
+A recipe is `<name>.toml`, or `<name>/recipe.toml` next to a `patches/` directory.
+Besides a git `repo`, a recipe can name a release `archive` with a mandatory
+`sha256`, and `patches` to apply before building (inside the sandbox).
 
 ```
-forge tap add https://github.com/noxilith/Forge-Packages
-forge search hypr          # searches your recipes and all taps
-forge tap update           # fetch newer recipes
-forge update <pkg> --refresh-recipe   # rebuild with the tap's current recipe
+forge search hypr          # searches the repository, your recipes and other repositories
+forge sync                 # fetch newer recipes
+forge update <pkg> --refresh-recipe   # rebuild with the repository's current recipe
+forge tap add <git-url>    # another repository with the same layout
 ```
 
-* Lookup order: `$FORGE_ROOT/recipes/` (your own) first, then taps in
-  alphabetical order. Dependencies named in a recipe are looked up the same way.
+`FORGE_REPO=<git-url>` replaces the official repository (an empty value means
+none), for your own distribution's or a mirror.
+
+* Lookup order: `$FORGE_ROOT/recipes/` (your own) first, then each repository's
+  `recipes/`, then its `void/`. Dependencies named in a recipe are looked up the
+  same way, so a hand-written recipe always beats an imported one.
 * An update normally uses the recipe saved when the package was installed, so a
   tap change never alters installed packages silently; `--refresh-recipe` opts in.
 * Recipes are build instructions that run in the sandbox, but they are still
@@ -402,6 +419,7 @@ $FORGE_ROOT/
 | `forge-store` | SQLite ownership DB, stage validation, atomic install/update, verified remove, verify |
 | `forge-build` | git mirror/checkout, build backends (one per build system), sandbox, orchestration |
 | `forge-cli` | the `forge` binary |
+| `forge-import` | `forge-import void <void-packages> --out <dir>`: parses Void templates (never runs them) into recipes |
 
 New build systems implement the small `Backend` trait in
 `forge-build/src/backends.rs`: it only *describes* commands; the sandbox is
@@ -438,7 +456,12 @@ checked. niri's session file runs `niri-session`, which the niri recipe does
 not install (it needs a systemd user unit), so `forge integrate niri` will
 refuse with an explanation until that is added.
 
-**The recipe set is mostly untested.** Forge-Packages has about 50 recipes (the
+**The imported Void recipes have never been built.** They are generated by
+parsing templates, and a recipe's header lists what could not be carried over
+(hooks such as `pre_configure`, compiler flags, dependencies with no recipe).
+Expect failures; each one is a fix to the importer or to a recipe.
+
+**The hand-written recipe set is mostly untested.** Forge-Packages has about 50 recipes (the
 Hyprland family and the libraries it needs, foot, fuzzel, wl-clipboard, grim,
 mako, niri, the GitHub CLI and more). About 35 of them built in my test runs;
 the rest were fixed after failing and never rebuilt, cannot build on the machine

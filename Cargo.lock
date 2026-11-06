@@ -255,6 +255,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "forge-import"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "forge-core",
+ "tempfile",
+ "toml",
+]
+
+[[package]]
 name = "forge-store"
 version = "0.1.0"
 dependencies = [

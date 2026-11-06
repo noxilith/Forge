@@ -70,6 +70,8 @@ struct Node {
     deps: Vec<(String, bool)>,
     reason: String,
     source_date_epoch: Option<i64>,
+    /// Patch files from the recipe, applied to the unpacked source before building.
+    patches: Vec<PathBuf>,
     /// A compiler Forge will provide for this build (and why the machine's won't do).
     toolchains: Vec<(toolchain::Plan, String)>,
 }
@@ -163,22 +165,19 @@ impl<'a> Planner<'a> {
         }
         let needed_by = self.visiting.last().cloned().unwrap_or_default();
         validate_name(name)?;
-        let catalog = taps::catalog(self.paths)?;
-        let entry = taps::find_by_name(&catalog, name).with_context(|| {
+        let entry = taps::lookup(self.paths, name)?.with_context(|| {
             format!(
-                "{needed_by} needs '{name}', which is not installed and has no recipe \
-                 (looked in {} and in {} tap(s); add one with `forge tap add <git-url>`)",
-                self.paths.recipes().display(),
-                taps::tap_names(self.paths).map(|t| t.len()).unwrap_or(0)
+                "{needed_by} needs '{name}', which is not installed and has no recipe in the Forge package \
+                 repository or in {} (try `forge sync` to refresh the repository)",
+                self.paths.recipes().display()
             )
         })?;
         let recipe = entry.recipe.clone();
         let file = entry.file.clone();
         let repo = recipe
-            .package
-            .repo
-            .clone()
-            .with_context(|| format!("{} has no package.repo", file.display()))?;
+            .source_url()
+            .map(str::to_string)
+            .with_context(|| format!("{} has neither package.repo nor package.archive", file.display()))?;
         self.add(Spec {
             name: name.to_string(),
             repo,
@@ -196,27 +195,56 @@ impl<'a> Planner<'a> {
 
     fn prepare(&mut self, mut spec: Spec, reason: String) -> Result<Node> {
         validate_name(&spec.name)?;
-        let (mirror, commit) = self.probe(&spec.repo, spec.resolve_rev.as_deref())?;
-        if let Some(pin) = spec.recipe.as_ref().and_then(|r| r.package.commit.clone()) {
-            if !commit.starts_with(&pin.to_ascii_lowercase()) {
-                bail!(
-                    "commit mismatch for {}: recipe pins {pin} but {} resolves to {commit}",
-                    spec.name,
-                    spec.resolve_rev.as_deref().unwrap_or("HEAD")
-                );
-            }
-        }
-        let version = fetch::version_for(&mirror, &commit);
-        let short = &commit[..8];
-        let base_id = if version.contains(short) { version.clone() } else { format!("{version}-{short}") };
-        validate_version_id(&base_id)?;
-
         let job_dir = self.plan_dir.join(&spec.name);
         std::fs::create_dir_all(&job_dir)?;
-        let spinner = ui::Spinner::start(&format!("unpack {}", spec.name), true);
-        let res = fetch::checkout(&mirror, &spec.repo, &commit, &job_dir.join("src"));
-        spinner.finish(res.is_ok(), "");
-        res?;
+
+        // Where the source comes from: a release tarball named by the recipe (checksummed),
+        // or a git repository pinned to a commit.
+        let archive = spec.recipe.as_ref().and_then(|r| {
+            let p = &r.package;
+            Some((p.archive.clone()?, p.sha256.clone()?, p.version.clone()?, p.strip_components.unwrap_or(1)))
+        });
+        let (mirror, commit, version, base_id, source_date_epoch);
+        if let Some((url, sha, ver, strip)) = archive {
+            let file_label = url.rsplit('/').next().unwrap_or("source").to_string();
+            let spinner = ui::Spinner::start(&format!("fetch {file_label}"), true);
+            let fetched = forge_build::archive::fetch(self.paths, &url, &sha, Some(&spinner));
+            spinner.finish(fetched.is_ok(), "");
+            let file = fetched?;
+            let spinner = ui::Spinner::start(&format!("unpack {}", spec.name), true);
+            let res = forge_build::archive::unpack(&file, &job_dir.join("src"), strip);
+            spinner.finish(res.is_ok(), "");
+            res?;
+            mirror = PathBuf::new();
+            base_id = format!("{ver}-{}", &sha[..8]);
+            commit = sha;
+            version = ver;
+            source_date_epoch = None;
+        } else {
+            let (m, c) = self.probe(&spec.repo, spec.resolve_rev.as_deref())?;
+            if let Some(pin) = spec.recipe.as_ref().and_then(|r| r.package.commit.clone()) {
+                if !c.starts_with(&pin.to_ascii_lowercase()) {
+                    bail!(
+                        "commit mismatch for {}: recipe pins {pin} but {} resolves to {c}",
+                        spec.name,
+                        spec.resolve_rev.as_deref().unwrap_or("HEAD")
+                    );
+                }
+            }
+            let v = fetch::version_for(&m, &c);
+            let short = &c[..8];
+            base_id = if v.contains(short) { v.clone() } else { format!("{v}-{short}") };
+            let spinner = ui::Spinner::start(&format!("unpack {}", spec.name), true);
+            let res = fetch::checkout(&m, &spec.repo, &c, &job_dir.join("src"));
+            spinner.finish(res.is_ok(), "");
+            res?;
+            source_date_epoch = fetch::commit_time(&m, &c);
+            mirror = m;
+            commit = c;
+            version = v;
+        }
+        let _ = &mirror;
+        validate_version_id(&base_id)?;
         if spec.recipe.is_none() {
             let in_repo = job_dir.join("src/forge.toml");
             if in_repo.is_file() {
@@ -241,13 +269,15 @@ impl<'a> Planner<'a> {
             bail!("{} cannot depend on itself", spec.name);
         }
         let toolchains = self.pick_toolchains(&spec.name, system, &job_dir.join("src"), &recipe)?;
+        let patches = recipe.patch_files()?;
         Ok(Node {
             name: spec.name,
             repo: spec.repo,
             store_rev: spec.store_rev,
             explicit: spec.explicit,
             replace: spec.replace,
-            source_date_epoch: fetch::commit_time(&mirror, &commit),
+            source_date_epoch,
+            patches,
             commit,
             version,
             base_id,
@@ -421,6 +451,8 @@ impl Plan<'_> {
             source_date_epoch: n.source_date_epoch,
             deps: self.closure(idx)?,
             toolchains: Vec::new(),
+            patches: n.patches.clone(),
+            patch_strip: n.recipe.package.patch_strip.unwrap_or(1),
         })
     }
 
@@ -689,42 +721,96 @@ pub struct InstallRequest {
     pub isolate: Option<String>,
 }
 
+/// `forge build <link>`: build one package from a git link (or a local repository).
 pub fn install(paths: &Paths, req: InstallRequest, flags: &Flags) -> Result<()> {
-    validate_name(&req.name)?;
-    check_sandbox(flags)?;
-    let existing = Store::open(paths)?.get(&req.name)?;
-    if let Some(m) = existing {
-        if m.explicit {
-            bail!("{} is already installed ({}); use `forge update {}`", req.name, m.version_id, req.name);
+    install_many(paths, vec![req], flags)
+}
+
+/// `forge install <name>...`: install packages by name from the Forge package repository
+/// (and your own recipes), and nowhere else.
+pub fn install_names(paths: &Paths, names: &[String], flags: &Flags, isolate: Option<String>) -> Result<()> {
+    let mut reqs = Vec::new();
+    for n in names {
+        if n.contains("://") || n.starts_with("git@") || (Path::new(n).is_dir() && (n.contains('/') || n.starts_with('.'))) {
+            bail!(
+                "'{n}' is a link or a path, and `forge install` takes package names from the Forge package \\
+                 repository. To build it from source, use `forge build {n}`"
+            );
         }
-        // Installed only as a dependency: keep it, and stop treating it as removable.
-        Store::open(paths)?.set_explicit(&req.name, true)?;
-        println!("{} {} was already installed as a dependency; it is now kept explicitly.", ui::check(), req.name);
+        validate_name(n)?;
+        let e = taps::lookup(paths, n)?.with_context(|| {
+            format!(
+                "there is no package named '{n}' in the Forge package repository (`forge search {n}` looks for similar \\
+                 names, `forge sync` refreshes the repository). To build it from a git link, use `forge build <link>`"
+            )
+        })?;
+        let repo = e
+            .recipe
+            .source_url()
+            .map(str::to_string)
+            .with_context(|| format!("{} has neither package.repo nor package.archive", e.file.display()))?;
+        reqs.push(InstallRequest {
+            repo,
+            name: n.clone(),
+            rev_spec: e.recipe.package.rev.clone(),
+            recipe_origin: e.origin(),
+            recipe: Some(e.recipe),
+            system_override: None,
+            isolate: isolate.clone(),
+        });
+    }
+    install_many(paths, reqs, flags)
+}
+
+fn install_many(paths: &Paths, reqs: Vec<InstallRequest>, flags: &Flags) -> Result<()> {
+    check_sandbox(flags)?;
+    let mut todo = Vec::new();
+    for req in reqs {
+        validate_name(&req.name)?;
+        let existing = Store::open(paths)?.get(&req.name)?;
+        match existing {
+            Some(m) if m.explicit => {
+                println!("  {} {} is already installed {}", ui::check(), req.name, ui::dim(&format!("({}; `forge update {}` checks for a newer one)", m.version_id, req.name)));
+            }
+            Some(_) => {
+                // Installed only as a dependency: keep it, and stop treating it as removable.
+                Store::open(paths)?.set_explicit(&req.name, true)?;
+                println!("{} {} was already installed as a dependency; it is now kept explicitly.", ui::check(), req.name);
+            }
+            None => todo.push(req),
+        }
+    }
+    if todo.is_empty() {
         return Ok(());
     }
     let mut planner = Planner::new(paths, flags)?;
     // With a recipe in hand, check the host for everything the whole dependency
     // tree needs before downloading anything.
-    if let Some(r) = &req.recipe {
-        if let Err(e) = preflight(paths, &req.name, r, &planner.installed, flags) {
-            let _ = rm_rf(&planner.plan_dir);
-            return Err(e);
+    for req in &todo {
+        if let Some(r) = &req.recipe {
+            if let Err(e) = preflight(paths, &req.name, r, &planner.installed, flags) {
+                let _ = rm_rf(&planner.plan_dir);
+                return Err(e);
+            }
         }
     }
     let result = (|| {
-        planner.add(Spec {
-            name: req.name,
-            repo: req.repo,
-            resolve_rev: req.rev_spec.clone(),
-            store_rev: req.rev_spec,
-            recipe: req.recipe,
-            origin: req.recipe_origin,
-            explicit: true,
-            replace: false,
-            system_override: req.system_override,
-            isolate: req.isolate,
-            reason: None,
-        })
+        for req in todo {
+            planner.add(Spec {
+                name: req.name,
+                repo: req.repo,
+                resolve_rev: req.rev_spec.clone(),
+                store_rev: req.rev_spec,
+                recipe: req.recipe,
+                origin: req.recipe_origin,
+                explicit: true,
+                replace: false,
+                system_override: req.system_override,
+                isolate: req.isolate,
+                reason: None,
+            })?;
+        }
+        Ok(())
     })();
     finish_plan(planner, result)
 }
@@ -747,6 +833,25 @@ pub fn update(paths: &Paths, names: Vec<String>, flags: &Flags, refresh_recipe: 
         let mut changed: BTreeMap<String, Manifest> = BTreeMap::new();
         for t in &targets {
             let m = planner.installed.get(t).with_context(|| format!("{t} is not installed"))?.clone();
+            // A package built from a release tarball is "up to date" when the repository's
+            // recipe still names the checksum it was built from.
+            if is_archive_package(&m) {
+                match taps::lookup(paths, &m.name)? {
+                    Some(e) if e.recipe.package.archive.is_some() => {
+                        if e.recipe.package.sha256.as_deref() == Some(m.commit.as_str()) {
+                            println!("  {} {} is up to date {}", ui::check(), m.name, ui::dim(&format!("({})", m.version_id)));
+                        } else {
+                            changed.insert(m.name.clone(), m);
+                        }
+                    }
+                    _ => println!(
+                        "  {} {} is no longer in the package repository, so there is nothing to update it from",
+                        ui::warn(),
+                        m.name
+                    ),
+                }
+                continue;
+            }
             let (_, commit) = planner.probe(&m.repo, m.rev_spec.as_deref())?;
             if commit == m.commit {
                 println!("  {} {} is up to date {}", ui::check(), m.name, ui::dim(&format!("({})", m.version_id)));
@@ -772,6 +877,25 @@ pub fn update(paths: &Paths, names: Vec<String>, flags: &Flags, refresh_recipe: 
         // one describes the same repository.
         let catalog = if refresh_recipe { taps::catalog(paths)? } else { Vec::new() };
         let spec_for = |m: &Manifest, pin_commit: bool, reason: &str| -> Result<Spec> {
+            if is_archive_package(m) {
+                // The repository's recipe defines the version (and holds the patches).
+                let e = taps::lookup(paths, &m.name)?
+                    .with_context(|| format!("{} is no longer in the package repository", m.name))?;
+                let repo = e.recipe.source_url().map(str::to_string).unwrap_or_else(|| m.repo.clone());
+                return Ok(Spec {
+                    name: m.name.clone(),
+                    repo,
+                    resolve_rev: None,
+                    store_rev: None,
+                    origin: e.origin(),
+                    recipe: Some(e.recipe),
+                    explicit: m.explicit,
+                    replace: true,
+                    system_override: None,
+                    isolate: None,
+                    reason: Some(reason.to_string()),
+                });
+            }
             let fresh = if refresh_recipe { taps::find_by_url(&catalog, &m.repo) } else { None };
             Ok(Spec {
                 name: m.name.clone(),
@@ -810,12 +934,16 @@ pub fn update(paths: &Paths, names: Vec<String>, flags: &Flags, refresh_recipe: 
     finish_plan(planner, result)
 }
 
+/// Was this package built from a release tarball (rather than a git commit)?
+fn is_archive_package(m: &Manifest) -> bool {
+    m.recipe.as_deref().and_then(|r| Recipe::parse(r).ok()).is_some_and(|r| r.package.archive.is_some())
+}
+
 /// Report every missing host tool or library for a recipe and all the Forge
 /// packages it needs (that aren't installed yet), using only the recipes: no
 /// network, no downloads. Complements the per-package check made once the
 /// sources are unpacked, which also covers auto-detected builds.
 fn preflight(paths: &Paths, name: &str, recipe: &Recipe, installed: &BTreeMap<String, Manifest>, flags: &Flags) -> Result<()> {
-    let catalog = taps::catalog(paths)?;
     let mut seen = BTreeSet::new();
     let mut stack = vec![(name.to_string(), recipe.clone())];
     let mut problems = String::new();
@@ -837,8 +965,8 @@ fn preflight(paths: &Paths, name: &str, recipe: &Recipe, installed: &BTreeMap<St
         }
         for d in r.package.deps.iter().chain(&r.build.deps) {
             if !installed.contains_key(d) {
-                if let Some(e) = taps::find_by_name(&catalog, d) {
-                    stack.push((d.clone(), e.recipe.clone()));
+                if let Ok(Some(e)) = taps::lookup(paths, d) {
+                    stack.push((d.clone(), e.recipe));
                 }
             }
         }
@@ -992,7 +1120,7 @@ pub fn resolve_target(
                     ui::bullet(),
                     e.name,
                     e.origin(),
-                    ui::dim("(--ignore-taps to build it without)")
+                    ui::dim("(--ignore-repo builds it without)")
                 );
                 recipe = Some(e.recipe.clone());
                 origin = e.origin();
@@ -1003,24 +1131,10 @@ pub fn resolve_target(
     } else if local.is_dir() && (target.contains('/') || target.starts_with('.')) {
         local.canonicalize()?.to_string_lossy().into_owned()
     } else {
-        validate_name(target)
-            .with_context(|| format!("'{target}' is not a URL, a repository path or a recipe name"))?;
-        let catalog = taps::catalog(paths)?;
-        let e = taps::find_by_name(&catalog, target).with_context(|| {
-            format!(
-                "no recipe named '{target}' (looked in {} and in {} tap(s)). \
-                 Use its git URL instead, or add a tap with `forge tap add <git-url>`",
-                paths.recipes().display(),
-                taps::tap_names(paths).map(|t| t.len()).unwrap_or(0)
-            )
-        })?;
-        let repo = e.recipe.package.repo.clone().with_context(|| format!("{} has no package.repo", e.file.display()))?;
-        if recipe.is_none() {
-            recipe = Some(e.recipe.clone());
-            origin = e.origin();
-        }
-        stem = Some(e.name.clone());
-        repo
+        bail!(
+            "'{target}' is not a git link or a path to a repository. `forge build` builds from a link \
+             (https://github.com/user/project); to install a package by name use `forge install {target}`"
+        );
     };
 
     let name = name

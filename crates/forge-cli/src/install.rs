@@ -678,6 +678,7 @@ impl Plan<'_> {
                 explicit: n.explicit,
                 run: n.recipe.run.clone(),
                 link_dir: link_dir(),
+                share_dir: share_dir(),
                 recipe: Some(n.recipe.to_toml()?),
             };
             match store.install(np, &cfg.stage(), n.recipe.install.exports.as_deref(), n.replace) {
@@ -1239,5 +1240,19 @@ impl Plan<'_> {
                 None
             }
         }
+    }
+}
+
+/// Where launchers look for menu entries and icons (`applications/`, `icons/`): `$XDG_DATA_HOME`,
+/// else `~/.local/share`; `/usr/local/share` for the system-wide install. `FORGE_SHARE_DIR`
+/// picks another directory, and empty turns it off.
+pub fn share_dir() -> Option<PathBuf> {
+    match std::env::var_os("FORGE_SHARE_DIR") {
+        Some(v) if v.is_empty() => None,
+        Some(v) => Some(PathBuf::from(v)),
+        None => match std::env::var_os("XDG_DATA_HOME").map(PathBuf::from) {
+            Some(p) if p.is_absolute() => Some(p),
+            _ => Some(PathBuf::from(std::env::var_os("HOME")?).join(".local/share")),
+        },
     }
 }

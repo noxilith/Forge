@@ -266,6 +266,9 @@ fn real_main() -> Result<()> {
         if std::env::var_os("FORGE_LINK_DIR").is_none() {
             unsafe { std::env::set_var("FORGE_LINK_DIR", "/usr/local/bin") };
         }
+        if std::env::var_os("FORGE_SHARE_DIR").is_none() {
+            unsafe { std::env::set_var("FORGE_SHARE_DIR", "/usr/local/share") };
+        }
         Paths::system_from_env(changes)?
     } else {
         // Never build or install as root by accident: untrusted code, and Forge needs no privileges.

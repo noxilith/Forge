@@ -77,6 +77,10 @@ pub struct NewPackage {
     /// Forge doesn't own is never replaced (the command stays available
     /// through `$FORGE_ROOT/bin`).
     pub link_dir: Option<PathBuf>,
+    /// The data directory launchers read (e.g. `~/.local/share`): the package's menu entries
+    /// (`share/applications/*.desktop`) and icons (`share/icons/**`) are linked into it, recorded
+    /// and removed like the command links. `None`: not linked.
+    pub share_dir: Option<PathBuf>,
     pub recipe: Option<String>,
 }
 
@@ -287,6 +291,17 @@ impl Store {
             }
         }
 
+        let mut share_plans: Vec<ExportPlan> = Vec::new();
+        if let Some(dir) = np.share_dir.as_deref() {
+            for sp in share_links(&self.paths, &np.name, &files, dir) {
+                if fs::symlink_metadata(&sp.link).is_ok() && self.export_owner(&sp.link)?.as_deref() != Some(np.name.as_str()) {
+                    eprintln!("warning: {} already exists and is not managed by Forge; left alone", sp.link.display());
+                    continue;
+                }
+                share_plans.push(sp);
+            }
+        }
+
         let manifest = Manifest {
             name: np.name.clone(),
             version: np.version,
@@ -311,7 +326,7 @@ impl Store {
         fs::rename(&staged, &pkgdir).with_context(|| {
             format!("moving build result into {} (same filesystem required)", pkgdir.display())
         })?;
-        let all_plans: Vec<ExportPlan> = plans.into_iter().chain(link_plans).collect();
+        let all_plans: Vec<ExportPlan> = plans.into_iter().chain(link_plans).chain(share_plans).collect();
         if let Err(e) = self.activate(&manifest, &pkgdir, &all_plans, existing.as_ref()) {
             let _ = rm_rf(&pkgdir);
             let _ = fs::remove_dir(&parent); // only succeeds if empty
@@ -359,6 +374,30 @@ impl Store {
                 return Err(e).with_context(|| format!("creating {}", link.display()));
             }
             created.push(link);
+        }
+        Ok(created)
+    }
+
+    /// Link an installed package's menu entries and icons into `dir` (see `NewPackage::share_dir`),
+    /// for packages installed before that existed. Existing links and files Forge doesn't own are
+    /// left alone. Returns the links created.
+    pub fn link_share_into(&mut self, name: &str, dir: &Path) -> Result<Vec<PathBuf>> {
+        validate_name(name)?;
+        let m = self.get(name)?.ok_or_else(|| anyhow!("package '{name}' is not installed"))?;
+        let mut created = Vec::new();
+        for sp in share_links(&self.paths, name, &m.files, dir) {
+            if fs::symlink_metadata(&sp.link).is_ok() {
+                continue;
+            }
+            if let Some(parent) = sp.link.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            self.conn.execute("INSERT INTO exports(link_path, pkg, target) VALUES (?1, ?2, ?3)", params![sp.link.to_string_lossy(), name, sp.target])?;
+            if let Err(e) = symlink(&sp.target, &sp.link) {
+                self.conn.execute("DELETE FROM exports WHERE link_path = ?1", [sp.link.to_string_lossy()])?;
+                return Err(e).with_context(|| format!("creating {}", sp.link.display()));
+            }
+            created.push(sp.link);
         }
         Ok(created)
     }
@@ -462,6 +501,9 @@ impl Store {
                 .with_context(|| format!("creating {}", cur.display()))?;
             undo.created.push(cur);
             for p in plans {
+                if let Some(parent) = p.link.parent() {
+                    fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
+                }
                 symlink(&p.target, &p.link)
                     .with_context(|| format!("creating {}", p.link.display()))?;
                 undo.created.push(p.link.clone());
@@ -831,6 +873,28 @@ impl Undo {
 }
 
 /// Decide which files get linked into `$FORGE_ROOT/bin`.
+/// Menu entries and icons in a package's files, as links into `dir`.
+fn share_links(paths: &Paths, name: &str, files: &[FileEntry], dir: &Path) -> Vec<ExportPlan> {
+    let mut out = Vec::new();
+    for f in files.iter().filter(|f| f.kind != FileKind::Dir) {
+        let Some(rest) = f.path.strip_prefix("share/") else { continue };
+        let wanted = match rest.strip_prefix("applications/") {
+            Some(b) => !b.contains('/') && b.ends_with(".desktop"),
+            None => rest.starts_with("icons/") && [".png", ".svg", ".xpm"].iter().any(|e| rest.ends_with(e)),
+        };
+        if !wanted || rest.split('/').any(|c| c.is_empty() || c == "..") {
+            continue;
+        }
+        out.push(ExportPlan {
+            rel: f.path.clone(),
+            link: dir.join(rest),
+            target: paths.current().join(name).join(&f.path).to_string_lossy().into_owned(),
+            base: rest.rsplit('/').next().unwrap_or(rest).to_string(),
+        });
+    }
+    out
+}
+
 fn plan_exports(
     paths: &Paths,
     name: &str,

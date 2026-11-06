@@ -39,6 +39,7 @@ fn np(name: &str, id: &str) -> NewPackage {
         explicit: true,
         run: forge_core::RunSection { isolate: Some("none".into()), ..Default::default() },
         link_dir: None,
+        share_dir: None,
         recipe: None,
     }
 }

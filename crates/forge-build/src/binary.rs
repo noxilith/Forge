@@ -35,6 +35,10 @@ pub struct Meta {
     pub platform: String,
     pub sha256: String,
     pub size: u64,
+    /// No file mentions the install root, so the package works under any `FORGE_ROOT`
+    /// (`root` is then empty and the key does not depend on it).
+    #[serde(default)]
+    pub relocatable: bool,
 }
 
 /// Everything a prebuilt package must match.
@@ -61,7 +65,56 @@ pub fn base_url() -> Option<String> {
     }
 }
 
+/// Does any file under `dir` (or any symlink target) contain `needle`? Forge's own `.forge/` and
+/// `.forge-run/` are skipped: they are not packed, and are made again wherever the package is installed.
+fn mentions(dir: &Path, needle: &[u8]) -> Result<bool> {
+    if needle.is_empty() {
+        return Ok(false);
+    }
+    let has = |hay: &[u8]| -> bool {
+        let first = needle[0];
+        let mut i = 0;
+        while let Some(p) = hay[i..].iter().position(|&b| b == first) {
+            let at = i + p;
+            if hay.len() - at < needle.len() {
+                return false;
+            }
+            if &hay[at..at + needle.len()] == needle {
+                return true;
+            }
+            i = at + 1;
+        }
+        false
+    };
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(d) = stack.pop() {
+        for e in fs::read_dir(&d)? {
+            let e = e?;
+            let p = e.path();
+            if d == dir && (e.file_name() == ".forge" || e.file_name() == ".forge-run") {
+                continue;
+            }
+            let ft = e.file_type()?;
+            if ft.is_dir() {
+                stack.push(p);
+            } else if ft.is_symlink() {
+                if has(std::os::unix::ffi::OsStrExt::as_bytes(fs::read_link(&p)?.as_os_str())) {
+                    return Ok(true);
+                }
+            } else if ft.is_file() && has(&fs::read(&p)?) {
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
+}
+
 impl Identity {
+    /// The same package for any root.
+    pub fn relocatable(&self) -> Identity {
+        Identity { root: PathBuf::new(), ..self.clone() }
+    }
+
     pub fn key(&self) -> Result<String> {
         let mut h = Sha256::new();
         let mut put = |label: &str, v: &[u8]| {
@@ -151,6 +204,10 @@ fn read_secret(path: &Path) -> Result<SigningKey> {
 /// Pack an installed package directory into `out`: the tarball, the JSON and the signature.
 pub fn pack(id: &Identity, package_dir: &Path, out: &Path, secret: &Path) -> Result<Meta> {
     let sk = read_secret(secret)?;
+    // Compiled programs often have their install path inside them; those only fit this root.
+    // A package that never mentions it (a script, most Rust and Go programs) fits any root.
+    let relocatable = !mentions(package_dir, id.root.to_string_lossy().as_bytes())?;
+    let id = &if relocatable { id.relocatable() } else { id.clone() };
     let key = id.key()?;
     fs::create_dir_all(out)?;
     let stem = format!("{}-{key}", platform());
@@ -175,6 +232,7 @@ pub fn pack(id: &Identity, package_dir: &Path, out: &Path, secret: &Path) -> Res
         platform: platform(),
         sha256: sha256_file(&tar)?,
         size: fs::metadata(&tar)?.len(),
+        relocatable,
     };
     let json = serde_json::to_vec_pretty(&meta)?;
     let sig: Signature = sk.sign(&json);
@@ -213,7 +271,7 @@ pub struct Prebuilt {
 }
 
 /// Look for a prebuilt package: `Ok(None)` when there is none (or none can be trusted).
-pub fn find(paths: &Paths, id: &Identity, work: &Path) -> Result<Option<Prebuilt>> {
+fn find_one(paths: &Paths, id: &Identity, work: &Path, relocatable: bool) -> Result<Option<Prebuilt>> {
     let Some(base) = base_url() else { return Ok(None) };
     let keys = trusted_keys(paths);
     if keys.is_empty() {
@@ -237,6 +295,7 @@ pub fn find(paths: &Paths, id: &Identity, work: &Path) -> Result<Option<Prebuilt
         && meta.name == id.name
         && meta.version_id == id.version_id
         && meta.platform == platform()
+        && meta.relocatable == relocatable
         && Path::new(&meta.root) == id.root;
     if !ok {
         eprintln!("warning: the prebuilt {} does not match what was asked for; building from source", id.name);
@@ -298,5 +357,74 @@ mod tests {
         let vk = parse_pubkey(&public).unwrap();
         assert!(vk.verify(b"data", &sig).is_ok());
         assert!(vk.verify(b"datb", &sig).is_err());
+    }
+}
+
+/// Look for a prebuilt package made for this root, else one that fits any root.
+pub fn find(paths: &Paths, id: &Identity, work: &Path) -> Result<Option<Prebuilt>> {
+    if let Some(p) = find_one(paths, id, work, false)? {
+        return Ok(Some(p));
+    }
+    find_one(paths, &id.relocatable(), work, true)
+}
+
+#[cfg(test)]
+mod relocatable_tests {
+    use super::*;
+
+    fn id(root: &str) -> Identity {
+        Identity { root: root.into(), name: "p".into(), version_id: "1-abc".into(), recipe_toml: "r".into(), patches: vec![] }
+    }
+
+    #[test]
+    fn finds_the_root_in_files_and_links_but_not_elsewhere() {
+        let d = tempfile::tempdir().unwrap();
+        fs::create_dir_all(d.path().join("bin")).unwrap();
+        fs::write(d.path().join("bin/a"), b"\x7fELF....stuff").unwrap();
+        assert!(!mentions(d.path(), b"/opt/forge/store/p/1").unwrap());
+        fs::write(d.path().join("bin/b"), b"\x00\x01/opt/forge/store/p/1/lib\x00").unwrap();
+        assert!(mentions(d.path(), b"/opt/forge/store/p/1").unwrap());
+        fs::remove_file(d.path().join("bin/b")).unwrap();
+        std::os::unix::fs::symlink("/opt/forge/store/p/1/x", d.path().join("bin/c")).unwrap();
+        assert!(mentions(d.path(), b"/opt/forge/store").unwrap());
+        assert!(!mentions(d.path(), b"").unwrap());
+    }
+
+    #[test]
+    fn packs_a_pathless_package_for_any_root_and_a_path_baked_one_for_its_root() {
+        let keys = tempfile::tempdir().unwrap();
+        keygen(keys.path()).unwrap();
+        let secret = keys.path().join("forge-binary.key");
+        let out = tempfile::tempdir().unwrap();
+
+        let plain = tempfile::tempdir().unwrap();
+        fs::write(plain.path().join("tool"), "no paths in here").unwrap();
+        let m = pack(&id("/home/me/forge"), plain.path(), out.path(), &secret).unwrap();
+        assert!(m.relocatable && m.root.is_empty());
+        assert_eq!(m.key, id("/anywhere/else").relocatable().key().unwrap());
+
+        let baked = tempfile::tempdir().unwrap();
+        fs::write(baked.path().join("lib"), "rpath=/home/me/forge/store/dep").unwrap();
+        let m = pack(&id("/home/me/forge"), baked.path(), out.path(), &secret).unwrap();
+        assert!(!m.relocatable && m.root == "/home/me/forge");
+        assert_eq!(m.key, id("/home/me/forge").key().unwrap());
+    }
+}
+
+#[cfg(test)]
+mod skip_tests {
+    use super::*;
+
+    #[test]
+    fn forges_own_directories_do_not_count() {
+        let d = tempfile::tempdir().unwrap();
+        for dir in [".forge", ".forge-run"] {
+            fs::create_dir_all(d.path().join(dir)).unwrap();
+            fs::write(d.path().join(dir).join("x"), "/opt/forge/store").unwrap();
+        }
+        assert!(!mentions(d.path(), b"/opt/forge").unwrap());
+        fs::create_dir_all(d.path().join("share/.forge")).unwrap();
+        fs::write(d.path().join("share/.forge/x"), "/opt/forge/store").unwrap();
+        assert!(mentions(d.path(), b"/opt/forge").unwrap(), "only the top-level ones are skipped");
     }
 }

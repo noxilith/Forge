@@ -71,8 +71,16 @@ pub fn info(paths: &Paths, store: &Store, name: &str) -> Result<()> {
     if !m.executables.is_empty() {
         kv("Executables", m.executables.join(", "));
     }
+    let mut icons = 0;
     for (l, t) in store.exports(&m.name)? {
+        if t.contains("/share/icons/") {
+            icons += 1; // listed as a count, not one line each
+            continue;
+        }
         kv("Link", format!("{} -> {t}", l.display()));
+    }
+    if icons > 0 {
+        kv("Icons", format!("{icons} linked for app launchers"));
     }
     println!();
     kv("Reason", if m.explicit { "installed explicitly" } else { "installed as a dependency" });
@@ -308,6 +316,12 @@ pub fn relink(paths: &Paths, package: Option<String>) -> Result<()> {
         for l in store.link_into(&n, &dir)? {
             println!("  {} linked {}", ui::check(), ui::tilde(&l));
             total += 1;
+        }
+        if let Some(share) = install::share_dir() {
+            for l in store.link_share_into(&n, &share)? {
+                println!("  {} linked {}", ui::check(), ui::tilde(&l));
+                total += 1;
+            }
         }
     }
     println!("  {} link(s) created in {}", ui::bold(&total.to_string()), ui::tilde(&dir));

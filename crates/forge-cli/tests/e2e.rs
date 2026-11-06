@@ -72,6 +72,7 @@ impl Fixture {
             .env("FORGE_WAYLAND_SESSIONS_DIR", self.sessions())
             .env("FORGE_XSESSIONS_DIR", self.root.parent().unwrap().join("xsessions"))
             .env("FORGE_LINK_DIR", self.linkbin()) // never the real ~/.local/bin
+            .env("FORGE_SHARE_DIR", self.root.parent().unwrap().join("share")) // nor the real ~/.local/share
             .args(args);
         c.envs(envs.iter().copied());
         if matches!(args[0], "install" | "build" | "update" | "upgrade" | "integrate" | "unintegrate") {
@@ -1664,6 +1665,12 @@ fn prebuilt_packages_are_verified_then_installed_instead_of_compiled() {
     assert!(o.status.success() && !text(&o).contains("Prebuilt"), "{}", text(&o));
     f.ok(&["remove", "greet"]);
 
+    // Nothing in this package names the install path, so it also fits a different root.
+    let elsewhere = f.repo.parent().unwrap().join("other-root");
+    let o = run(&["install", "greet"], &[("FORGE_BINARY_URL", server.as_str()), ("FORGE_BINARY_PUBKEY", public.as_str()), ("FORGE_ROOT", elsewhere.to_str().unwrap())]);
+    assert!(o.status.success() && text(&o).contains("Prebuilt") && !text(&o).contains("apply patches"), "{}", text(&o));
+    f.forge_with(&["remove", "greet"], &[("FORGE_ROOT", elsewhere.to_str().unwrap())]);
+
     // A key nobody trusts: the prebuilt is ignored and the package is compiled.
     let other = f.repo.parent().unwrap().join("other-keys");
     run(&["binary", "keygen", other.to_str().unwrap()], &[]);
@@ -1702,4 +1709,59 @@ fn the_system_wide_install_can_be_read_but_only_root_changes_it() {
 unsafe extern "C" {
     #[link_name = "geteuid"]
     fn libc_geteuid() -> u32;
+}
+
+const APP_MAKEFILE: &str = "PREFIX ?= /usr/local
+all:
+install:
+\tinstall -d $(DESTDIR)$(PREFIX)/bin $(DESTDIR)$(PREFIX)/share/applications $(DESTDIR)$(PREFIX)/share/icons/hicolor/48x48/apps
+\tprintf '#!/bin/sh\\necho hello-v1\\n' > $(DESTDIR)$(PREFIX)/bin/hello && chmod +x $(DESTDIR)$(PREFIX)/bin/hello
+\tprintf '[Desktop Entry]\\nType=Application\\nName=Hello\\nExec=hello\\nIcon=hello\\n' > $(DESTDIR)$(PREFIX)/share/applications/hello.desktop
+\tprintf 'png' > $(DESTDIR)$(PREFIX)/share/icons/hicolor/48x48/apps/hello.png
+";
+
+#[test]
+fn menu_entries_and_icons_are_linked_for_app_launchers_and_removed_with_the_package() {
+    let f = fixture(APP_MAKEFILE);
+    let share = f.root.parent().unwrap().join("share");
+    f.ok(&["build", f.repo_str(), "--name", "hello"]);
+
+    let desktop = share.join("applications/hello.desktop");
+    let icon = share.join("icons/hicolor/48x48/apps/hello.png");
+    for l in [&desktop, &icon] {
+        let target = fs::read_link(l).unwrap_or_else(|_| panic!("{} is not a link", l.display()));
+        // Through the stable `current` link, so an update keeps working.
+        assert!(target.starts_with(f.root.join("current/hello")), "{}", target.display());
+    }
+    assert!(fs::read_to_string(&desktop).unwrap().contains("Exec=hello"));
+    let info = f.ok(&["info", "hello"]);
+    assert!(info.contains("hello.desktop") && info.contains("1 linked for app launchers"), "{info}");
+
+    // Removing the package takes its launcher entries with it.
+    f.ok(&["remove", "hello"]);
+    assert!(fs::symlink_metadata(&desktop).is_err() && fs::symlink_metadata(&icon).is_err());
+}
+
+#[test]
+fn launcher_links_never_replace_a_file_forge_does_not_own_and_relink_repairs_old_installs() {
+    let f = fixture(APP_MAKEFILE);
+    let share = f.root.parent().unwrap().join("share");
+    fs::create_dir_all(share.join("applications")).unwrap();
+    fs::write(share.join("applications/hello.desktop"), "mine").unwrap();
+    let o = f.forge(&["build", f.repo_str(), "--name", "hello"]);
+    assert!(o.status.success());
+    assert!(String::from_utf8_lossy(&o.stderr).contains("not managed by Forge"), "{}", String::from_utf8_lossy(&o.stderr));
+    assert_eq!(fs::read_to_string(share.join("applications/hello.desktop")).unwrap(), "mine");
+    assert!(fs::symlink_metadata(share.join("icons/hicolor/48x48/apps/hello.png")).is_ok(), "the icon was still linked");
+    f.ok(&["remove", "hello"]);
+    assert_eq!(fs::read_to_string(share.join("applications/hello.desktop")).unwrap(), "mine", "removal leaves it alone");
+
+    // An install made without launcher links (disabled) is repaired by `relink`.
+    let o = f.forge_with(&["build", f.repo_str(), "--name", "hello"], &[("FORGE_SHARE_DIR", "")]);
+    assert!(o.status.success());
+    fs::remove_file(share.join("applications/hello.desktop")).unwrap();
+    assert!(fs::symlink_metadata(share.join("icons/hicolor/48x48/apps/hello.png")).is_err());
+    f.ok(&["relink", "hello"]);
+    assert!(fs::symlink_metadata(share.join("applications/hello.desktop")).is_ok());
+    assert!(fs::symlink_metadata(share.join("icons/hicolor/48x48/apps/hello.png")).is_ok());
 }

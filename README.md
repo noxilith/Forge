@@ -31,6 +31,13 @@ warns, and the command stays available through `$FORGE_ROOT/bin`).
 If you have no suitable directory, put Forge's own `bin/` on your PATH instead:
 `eval "$(forge env)"`.
 
+**App launchers.** A package's menu entries (`share/applications/*.desktop`) and icons
+(`share/icons/**`) are linked into `~/.local/share` (`/usr/local/share` for the system-wide
+install), so apps show up in rofi, fuzzel, wofi and desktop menus, and disappear when the package
+is removed. Like the command links, they are tracked, never replace a file Forge does not own,
+and `forge relink` adds them for packages installed earlier. `FORGE_SHARE_DIR=<dir>` picks another
+directory; empty turns it off.
+
 **Speed.** A source build can't match downloading a binary: a first install
 is git (a few seconds) plus compiling. For fastfetch on an 8-core laptop that
 is about 4s of git and 14s of compile. Forge's own work is well under a
@@ -422,8 +429,10 @@ when the repository's release (`FORGE_BINARY_URL`, by default
 * signed by a key the machine trusts (`OFFICIAL_PUBKEY`, `FORGE_BINARY_PUBKEY`, or a
   `*.pub` file in `/etc/forge/binary-keys/`),
 * for exactly this package: the same version, dependency versions, recipe, patches,
-  platform (`FORGE_PLATFORM`, default `x86_64-linux`) and **`FORGE_ROOT`** (programs have
-  their install path built in, so a binary only fits a machine with the same root), and
+  platform (`FORGE_PLATFORM`, default `x86_64-linux`) and **`FORGE_ROOT`** (programs often have
+  their install path built in, so a binary only fits a machine with the same root; but `forge
+  binary pack` checks, and a package in which no file names the root, such as a script or most
+  Rust and Go programs, is marked *relocatable* and fits every root, per-user installs included), and
 * matching its signed SHA-256.
 
 Anything else is ignored and the package is compiled. `--from-source` always compiles.

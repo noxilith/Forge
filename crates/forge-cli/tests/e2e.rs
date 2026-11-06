@@ -325,6 +325,8 @@ tool="$(command -v base-tool)"
 [ -n "$tool" ]
 case "$FORGE_DEPS" in *base*) ;; *) echo "FORGE_DEPS=$FORGE_DEPS"; exit 1;; esac
 pkg-config --exists base
+# Headers of a dependency are on the compiler's include path (CPATH), pkg-config file or not.
+case "$CPATH" in */store/base/*/include*) ;; *) echo "CPATH=$CPATH"; exit 1;; esac
 mkdir -p "$D/bin"
 printf '#!/bin/sh\necho app+$(%s)\n' "$tool" > "$D/bin/app"
 chmod +x "$D/bin/app"

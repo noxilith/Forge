@@ -211,6 +211,8 @@ pub fn build(cfg: &BuildConfig) -> Result<PathBuf> {
             env.push((k, v));
         }
     }
+    let dirs = forge_core::util::path_dirs();
+    compiler_fallback(&mut env, &|t| forge_core::util::found_in(&dirs, t));
     for (k, v) in &cfg.recipe.build.env {
         env.retain(|(ek, _)| ek != k);
         env.push((k.clone(), v.clone()));
@@ -345,6 +347,24 @@ fn apply_deps(cfg: &BuildConfig, env: &mut Vec<(String, String)>) {
     }
 }
 
+/// Some machines have `gcc` but no `cc` (and no `c++`), which leaves Rust, CMake and friends with no
+/// compiler to find. When the user has not chosen one, point the build at `gcc`/`g++`.
+fn compiler_fallback(env: &mut Vec<(String, String)>, have: &dyn Fn(&str) -> bool) {
+    let set = |env: &mut Vec<(String, String)>, k: &str, v: &str| {
+        if !env.iter().any(|(ek, _)| ek == k) {
+            env.push((k.to_string(), v.to_string()));
+        }
+    };
+    if !have("cc") && have("gcc") {
+        set(env, "CC", "gcc");
+        let key = format!("CARGO_TARGET_{}_UNKNOWN_LINUX_GNU_LINKER", std::env::consts::ARCH.to_uppercase());
+        set(env, &key, "gcc");
+    }
+    if !have("c++") && have("g++") {
+        set(env, "CXX", "g++");
+    }
+}
+
 /// Host environment variables that configure the compiler toolchain.
 fn passthrough(name: &str) -> bool {
     matches!(
@@ -382,4 +402,30 @@ pub fn log_tail(log: &Path, lines: usize) -> String {
     let text = fs::read_to_string(log).unwrap_or_default();
     let all: Vec<&str> = text.lines().collect();
     all[all.len().saturating_sub(lines)..].join("\n")
+}
+
+#[cfg(test)]
+mod compiler_fallback_tests {
+    use super::compiler_fallback;
+
+    fn run(have: &[&str], env: &[(&str, &str)]) -> Vec<(String, String)> {
+        let mut e: Vec<(String, String)> = env.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();
+        compiler_fallback(&mut e, &|t| have.contains(&t));
+        e
+    }
+
+    #[test]
+    fn falls_back_to_gcc_when_cc_is_missing() {
+        let e = run(&["gcc", "g++"], &[]);
+        assert!(e.contains(&("CC".into(), "gcc".into())) && e.contains(&("CXX".into(), "g++".into())));
+        assert!(e.iter().any(|(k, v)| k.starts_with("CARGO_TARGET_") && k.ends_with("_LINKER") && v == "gcc"));
+    }
+
+    #[test]
+    fn leaves_a_working_cc_and_the_users_choices_alone() {
+        assert!(run(&["cc", "gcc", "c++", "g++"], &[]).is_empty());
+        let e = run(&["gcc"], &[("CC", "clang")]);
+        assert_eq!(e.iter().filter(|(k, _)| k == "CC").count(), 1);
+        assert!(e.contains(&("CC".into(), "clang".into())));
+    }
 }

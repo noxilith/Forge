@@ -66,10 +66,19 @@ fn session_dir(kind: &str) -> Result<PathBuf> {
 }
 
 fn run_sudo(args: &[&std::ffi::OsStr]) -> Result<()> {
-    println!("  running: sudo {}", args.iter().map(|a| a.to_string_lossy()).collect::<Vec<_>>().join(" "));
-    let status = Command::new("sudo")
-        .args(args)
-        .status()
+    // Already root (the system-wide install): no sudo needed.
+    let as_root = unsafe { libc::geteuid() } == 0;
+    println!("  running: {}{}", if as_root { "" } else { "sudo " }, args.iter().map(|a| a.to_string_lossy()).collect::<Vec<_>>().join(" "));
+    let status = (if as_root {
+        let mut c = Command::new(args[0]);
+        c.args(&args[1..]);
+        c
+    } else {
+        let mut c = Command::new("sudo");
+        c.args(args);
+        c
+    })
+    .status()
         .context("running sudo (is it installed?). Run the command above as root to finish manually")?;
     if !status.success() {
         bail!("sudo command failed ({status})");

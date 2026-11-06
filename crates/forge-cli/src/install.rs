@@ -30,6 +30,8 @@ pub struct Flags {
     pub keep_build: bool,
     /// Show every command that will run, not only the ones a recipe supplies.
     pub details: bool,
+    /// Use prebuilt packages when the repository has them (off with `--from-source`).
+    pub binaries: bool,
 }
 
 /// What to build, before it has been looked at.
@@ -546,9 +548,15 @@ impl Plan<'_> {
         let n_nodes = self.nodes.len();
         let configs: Vec<BuildConfig> = (0..n_nodes).map(|i| self.config(i)).collect::<Result<_>>()?;
 
+        // Prebuilt packages: found and verified now, downloaded after you agree.
+        let prebuilt: Vec<Option<forge_build::binary::Prebuilt>> = self.nodes.iter().map(|n| self.find_prebuilt(n)).collect();
+
         // Host requirements for every package, reported together.
         let mut problems = String::new();
-        for (n, cfg) in self.nodes.iter().zip(&configs) {
+        for (i, (n, cfg)) in self.nodes.iter().zip(&configs).enumerate() {
+            if prebuilt[i].is_some() {
+                continue; // nothing to compile, so no compilers or libraries needed
+            }
             let tools = forge_build::build::required_tools(cfg);
             let provided: Vec<&str> = n.toolchains.iter().flat_map(|(t, _)| t.tool.provides().iter().copied()).collect();
             let mut mt = forge_build::deps::missing_tools(&tools, self.flags.sandbox);
@@ -569,6 +577,10 @@ impl Plan<'_> {
         }
 
         self.print_plan(&configs);
+        let pre: Vec<String> = self.nodes.iter().zip(&prebuilt).filter(|(_, p)| p.is_some()).map(|(n, _)| n.name.clone()).collect();
+        if !pre.is_empty() {
+            println!("  {} {}  {}", ui::bullet(), ui::bold("Prebuilt"), ui::dim(&format!("{} (downloaded, not compiled; --from-source compiles)", pre.join(", "))));
+        }
         if !self.flags.yes && !confirm("Proceed?")? {
             bail!("aborted");
         }
@@ -576,7 +588,13 @@ impl Plan<'_> {
         // Compilers Forge provides: downloaded and verified now, after you agreed, and reused later.
         let mut configs = configs;
         let mut ready: BTreeMap<PathBuf, toolchain::Ready> = BTreeMap::new();
-        let wanted: Vec<&toolchain::Plan> = self.nodes.iter().flat_map(|n| n.toolchains.iter().map(|(p, _)| p)).collect();
+        let wanted: Vec<&toolchain::Plan> = self
+            .nodes
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| prebuilt[*i].is_none())
+            .flat_map(|(_, n)| n.toolchains.iter().map(|(p, _)| p))
+            .collect();
         if wanted.iter().any(|p| !p.cached) {
             println!("\n{}", ui::bold("Toolchains"));
         }
@@ -595,7 +613,10 @@ impl Plan<'_> {
             ready.insert(p.dir.clone(), r.with_context(|| format!("getting {}", p.label()))?);
         }
         for (i, n) in self.nodes.iter().enumerate() {
-            configs[i].toolchains = n.toolchains.iter().map(|(p, _)| ready[&p.dir].clone()).collect();
+            if prebuilt[i].is_some() {
+                continue;
+            }
+            configs[i].toolchains =n.toolchains.iter().map(|(p, _)| ready[&p.dir].clone()).collect();
         }
 
         // Phase 1: build everything. Nothing is installed yet.
@@ -609,6 +630,17 @@ impl Plan<'_> {
             }
             if n_nodes > 1 {
                 println!("  {} {}", ui::bold(&n.name), ui::dim(&n.version_id));
+            }
+            if let Some(pb) = &prebuilt[i] {
+                let t = std::time::Instant::now();
+                let dest = n.staged_prefix(self.paths);
+                let work = self.plan_dir.join("prebuilt");
+                let spinner = ui::Spinner::start(&format!("download {}", n.name), !self.flags.verbose);
+                let res = pb.unpack_into(&dest, &work);
+                spinner.finish(res.is_ok(), "");
+                res.with_context(|| format!("getting the prebuilt {} (retry with --from-source to compile it)", n.name))?;
+                println!("{}", ui::step_line(true, "prebuilt", "", t.elapsed()));
+                continue;
             }
             if let Err(e) = build(cfg) {
                 eprintln!(
@@ -1185,4 +1217,27 @@ pub fn available_updates(paths: &Paths) -> Result<Vec<Available>> {
         }
     }
     Ok(out)
+}
+
+impl Plan<'_> {
+    /// The prebuilt package for `n`, if the repository has one this machine can trust.
+    fn find_prebuilt(&self, n: &Node) -> Option<forge_build::binary::Prebuilt> {
+        if !self.flags.binaries || (n.recipe.package.repo.is_none() && n.recipe.package.archive.is_none()) {
+            return None;
+        }
+        let id = forge_build::binary::Identity {
+            root: self.paths.root().to_path_buf(),
+            name: n.name.clone(),
+            version_id: n.version_id.clone(),
+            recipe_toml: n.recipe.to_toml().ok()?,
+            patches: n.patches.clone(),
+        };
+        match forge_build::binary::find(self.paths, &id, &self.plan_dir.join("prebuilt")) {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("{} no prebuilt {}: {e:#}", ui::warn(), n.name);
+                None
+            }
+        }
+    }
 }

@@ -68,6 +68,7 @@ impl Fixture {
         let mut c = Command::new(env!("CARGO_BIN_EXE_forge"));
         c.env("FORGE_ROOT", &self.root)
             .env("FORGE_REPO", "")
+            .env("FORGE_BINARY_URL", "") // never the network
             .env("FORGE_WAYLAND_SESSIONS_DIR", self.sessions())
             .env("FORGE_XSESSIONS_DIR", self.root.parent().unwrap().join("xsessions"))
             .env("FORGE_LINK_DIR", self.linkbin()) // never the real ~/.local/bin
@@ -1613,4 +1614,92 @@ fn sync_refreshes_the_repository_and_reports_updates_for_installed_packages() {
     // Sync only checks: the installed version is untouched.
     assert_eq!(run_bin(&f, "greet"), "patched");
     assert!(run(&["list"]).contains("1.0"));
+}
+
+#[test]
+fn prebuilt_packages_are_verified_then_installed_instead_of_compiled() {
+    let f = fixture("");
+    if !f.sandbox {
+        eprintln!("skipping: needs the sandbox");
+        return;
+    }
+    let (repo, envs) = archive_repo(&f);
+    let url = repo.to_str().unwrap().to_string();
+    let keys = f.repo.parent().unwrap().join("keys");
+    let bins = f.repo.parent().unwrap().join("bins");
+    let base: Vec<(&str, &str)> = envs.iter().map(|(k, v)| (*k, v.as_str())).chain([("FORGE_REPO", url.as_str())]).collect();
+    let run = |args: &[&str], extra: &[(&str, &str)]| {
+        let all: Vec<(&str, &str)> = base.iter().chain(extra).copied().collect();
+        f.forge_with(args, &all)
+    };
+    let text = |o: &Output| format!("{}{}", String::from_utf8_lossy(&o.stdout), String::from_utf8_lossy(&o.stderr));
+
+    // The maintainer builds from source, then packs and signs.
+    let o = run(&["binary", "keygen", keys.to_str().unwrap()], &[]);
+    assert!(o.status.success(), "{}", text(&o));
+    let public = fs::read_to_string(keys.join("forge-binary.pub")).unwrap().trim().to_string();
+    let secret = keys.join("forge-binary.key");
+    assert_eq!(fs::metadata(&secret).unwrap().permissions().mode() & 0o777, 0o600);
+    let o = run(&["install", "greet", "--from-source"], &[]);
+    assert!(o.status.success(), "{}", text(&o));
+    let o = run(&["binary", "pack", "greet", "--out", bins.to_str().unwrap(), "--secret", secret.to_str().unwrap()], &[]);
+    assert!(o.status.success(), "{}", text(&o));
+    let files: Vec<String> = fs::read_dir(&bins).unwrap().flatten().map(|e| e.file_name().to_string_lossy().into_owned()).collect();
+    assert_eq!(files.len(), 3, "{files:?}");
+
+    let server = format!("file://{}", bins.display());
+    let trusted = [("FORGE_BINARY_URL", server.as_str()), ("FORGE_BINARY_PUBKEY", public.as_str())];
+    f.ok(&["remove", "greet"]);
+
+    // A machine that trusts the key downloads the package instead of compiling it.
+    let o = run(&["install", "greet"], &trusted);
+    let out = text(&o);
+    assert!(o.status.success() && out.contains("Prebuilt") && !out.contains("apply patches"), "{out}");
+    assert_eq!(run_bin(&f, "greet"), "patched");
+    assert!(f.ok(&["verify"]).contains("intact"));
+    f.ok(&["remove", "greet"]);
+
+    // --from-source compiles even when a prebuilt exists.
+    let o = run(&["install", "greet", "--from-source"], &trusted);
+    assert!(o.status.success() && !text(&o).contains("Prebuilt"), "{}", text(&o));
+    f.ok(&["remove", "greet"]);
+
+    // A key nobody trusts: the prebuilt is ignored and the package is compiled.
+    let other = f.repo.parent().unwrap().join("other-keys");
+    run(&["binary", "keygen", other.to_str().unwrap()], &[]);
+    let wrong = fs::read_to_string(other.join("forge-binary.pub")).unwrap().trim().to_string();
+    let o = run(&["install", "greet"], &[("FORGE_BINARY_URL", server.as_str()), ("FORGE_BINARY_PUBKEY", wrong.as_str())]);
+    assert!(o.status.success() && !text(&o).contains("Prebuilt"), "{}", text(&o));
+    f.ok(&["remove", "greet"]);
+
+    // A tampered tarball is refused (the signed checksum no longer matches) and nothing is installed.
+    let tar = bins.join(files.iter().find(|n| n.ends_with(".tar.gz")).unwrap());
+    let mut data = fs::read(&tar).unwrap();
+    let last = data.len() - 1;
+    data[last] ^= 0xff;
+    fs::write(&tar, data).unwrap();
+    let o = run(&["install", "greet"], &trusted);
+    assert!(!o.status.success() && text(&o).contains("checksum"), "{}", text(&o));
+    assert!(!f.root.join("bin/greet").exists());
+}
+
+#[test]
+fn the_system_wide_install_can_be_read_but_only_root_changes_it() {
+    let f = fixture("");
+    fs::create_dir_all(&f.root).unwrap();
+    let out = f.forge_with(&["--system", "list"], &[]);
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    if unsafe { libc_geteuid() } != 0 {
+        let o = f.forge_with(&["--system", "install", "whatever"], &[]);
+        assert!(!o.status.success());
+        assert!(String::from_utf8_lossy(&o.stderr).contains("needs root"), "{}", String::from_utf8_lossy(&o.stderr));
+    }
+    // Skipping the sandbox is never allowed there.
+    let o = f.forge_with(&["--system", "build", "x", "--insecure-no-sandbox"], &[]);
+    assert!(!o.status.success());
+}
+
+unsafe extern "C" {
+    #[link_name = "geteuid"]
+    fn libc_geteuid() -> u32;
 }

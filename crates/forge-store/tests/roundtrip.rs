@@ -726,3 +726,34 @@ fn files_installed_outside_the_prefix_are_reported_even_when_the_prefix_is_empty
     assert!(err.contains("outside its prefix") && err.contains("/usr/lib/qt6/qml/x/qmldir"), "{err}");
     assert!(!err.contains("installed nothing"), "{err}");
 }
+
+#[test]
+fn system_install_keeps_each_users_data_in_their_own_home() {
+    let root_dir = tempfile::tempdir().unwrap();
+    let stage_dir = tempfile::tempdir().unwrap();
+    let paths = Paths::new_system(root_dir.path().canonicalize().unwrap());
+    paths.ensure_layout().unwrap();
+    let e = Env { stage: stage_dir.path().to_path_buf(), _root_dir: root_dir, _stage_dir: stage_dir, paths };
+    let mut store = Store::open(&e.paths).unwrap();
+    let prog = "#!/bin/sh\necho \"xdg=$XDG_CONFIG_HOME arg=$*\"\n";
+    let stage = make_stage(&e, "app", "1-x", &[("bin/app", prog, 0o755)]);
+    let mut p = np("app", "1-x");
+    p.run = forge_core::RunSection { args: vec!["--dir".into(), "{data}/my dir".into()], ..Default::default() };
+    store.install(p, &stage, None, false).unwrap();
+
+    // The script holds no user's path: two users get two data directories.
+    let script = fs::read_to_string(e.paths.bin().join("app")).unwrap();
+    assert!(script.contains("$FORGE_DATA") && !script.contains(&e.paths.root().to_string_lossy().to_string().replace("/", "//")), "{script}");
+    for user in ["alice", "bob"] {
+        let home = tempfile::tempdir().unwrap();
+        let out = run_cmd(&e, "app", &[], &[("XDG_DATA_HOME", &home.path().to_string_lossy()), ("HOME", user)]);
+        let data = home.path().join("forge/data/app");
+        assert!(out.contains(&format!("xdg={}/config", data.display())), "{out}");
+        assert!(out.contains(&format!("arg=--dir {}/my dir", data.display())), "{out}");
+        assert!(data.join("config").is_dir());
+    }
+    // Nothing of the users' data lives in (or is removed from) the shared tree.
+    assert!(!e.paths.root().join("data").join("app").exists());
+    store.remove("app", false).unwrap();
+    assert!(!store.remove_data("app").unwrap());
+}

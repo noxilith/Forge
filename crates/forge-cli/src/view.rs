@@ -322,7 +322,7 @@ pub fn doctor(paths: &Paths) -> Result<()> {
     println!();
     println!("  {} {}", ui::bullet(), ui::bold("Forge"));
     row(true, "root", &ui::tilde(paths.root()));
-    row(unsafe { libc::geteuid() } != 0, "not running as root", "builds untrusted code, needs no privileges");
+    row(paths.is_system() || unsafe { libc::geteuid() } != 0, "not running as root", "builds untrusted code, needs no privileges (the system-wide install is root's to change)");
     let dirs = path_dirs();
     row(found_in(&dirs, "git"), "git", "");
     match forge_build::sandbox::check() {

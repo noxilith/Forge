@@ -1,3 +1,4 @@
+mod binary;
 mod install;
 mod taps;
 mod view;
@@ -13,8 +14,21 @@ use std::path::PathBuf;
 #[derive(Parser)]
 #[command(name = "forge", version, about = "A source-based package manager with isolated, cleanly removable packages")]
 struct Cli {
+    /// Use the system-wide install shared by all users (`/opt/forge`, or $FORGE_ROOT) instead of your own.
+    /// Changing it needs root. Also set by FORGE_SYSTEM=1.
+    #[arg(long, global = true)]
+    system: bool,
     #[command(subcommand)]
     cmd: Cmd,
+}
+
+/// Does this command write to the install (as opposed to only reading it)?
+fn changes_things(cmd: &Cmd) -> bool {
+    match cmd {
+        Cmd::List | Cmd::Info { .. } | Cmd::Search { .. } | Cmd::Verify { .. } | Cmd::Doctor | Cmd::Env | Cmd::Binary { .. } => false,
+        Cmd::Tap { cmd: TapCmd::List } | Cmd::Toolchain { cmd: ToolchainCmd::List } => false,
+        _ => true,
+    }
 }
 
 #[derive(clap::Args, Clone)]
@@ -34,6 +48,9 @@ struct BuildFlags {
     /// List every command that will run, not only the ones a recipe supplies.
     #[arg(long)]
     details: bool,
+    /// Compile everything instead of using prebuilt packages.
+    #[arg(long)]
+    from_source: bool,
 }
 
 #[derive(Subcommand)]
@@ -158,10 +175,34 @@ enum Cmd {
         #[command(subcommand)]
         cmd: ToolchainCmd,
     },
+    /// Make the signed prebuilt packages that `forge install` downloads (for repository maintainers).
+    Binary {
+        #[command(subcommand)]
+        cmd: BinaryCmd,
+    },
     /// Check that this machine can run Forge builds.
     Doctor,
     /// Print the shell line that puts Forge's commands on PATH.
     Env,
+}
+
+#[derive(Subcommand)]
+enum BinaryCmd {
+    /// Make a signing key pair in a directory.
+    Keygen { dir: PathBuf },
+    /// Pack installed packages: a tarball, its metadata and a signature each.
+    Pack {
+        packages: Vec<String>,
+        /// Pack every installed package.
+        #[arg(long)]
+        all: bool,
+        /// Where to write the files.
+        #[arg(long)]
+        out: PathBuf,
+        /// The secret key from `forge binary keygen`.
+        #[arg(long)]
+        secret: PathBuf,
+    },
 }
 
 #[derive(Subcommand)]
@@ -205,11 +246,34 @@ fn main() {
 
 fn real_main() -> Result<()> {
     let cli = Cli::parse();
-    // Never build or install as root: untrusted code, and Forge needs no privileges.
-    if unsafe { libc::geteuid() } == 0 && !matches!(cli.cmd, Cmd::Doctor | Cmd::Env) {
-        bail!("refusing to run as root: Forge builds untrusted code and needs no privileges");
-    }
-    let paths = Paths::from_env()?;
+    let is_root = unsafe { libc::geteuid() } == 0;
+    let system = cli.system || std::env::var("FORGE_SYSTEM").is_ok_and(|v| v == "1");
+    let paths = if system {
+        // The shared install: root changes it (builds still run in the sandbox), everyone can read it.
+        let changes = changes_things(&cli.cmd);
+        if changes && !is_root {
+            bail!("changing the system-wide install needs root: run `sudo forge --system ...`");
+        }
+        if let Cmd::Install { flags, .. } | Cmd::Build { flags, .. } | Cmd::Update { flags, .. } | Cmd::Upgrade { flags, .. } = &cli.cmd {
+            if flags.insecure_no_sandbox {
+                bail!("--insecure-no-sandbox is not allowed in the system-wide install");
+            }
+        }
+        if is_root {
+            unsafe { libc::umask(0o022) }; // what is installed must be readable by everyone
+        }
+        // Commands go where every user's PATH already looks, unless FORGE_LINK_DIR says otherwise.
+        if std::env::var_os("FORGE_LINK_DIR").is_none() {
+            unsafe { std::env::set_var("FORGE_LINK_DIR", "/usr/local/bin") };
+        }
+        Paths::system_from_env(changes)?
+    } else {
+        // Never build or install as root by accident: untrusted code, and Forge needs no privileges.
+        if is_root && !matches!(cli.cmd, Cmd::Doctor | Cmd::Env) {
+            bail!("refusing to run as root: Forge builds untrusted code and needs no privileges (for the system-wide install use `forge --system`)");
+        }
+        Paths::from_env()?
+    };
     match cli.cmd {
         Cmd::Install { names, isolate, flags } => {
             taps::ensure_default(&paths)?;
@@ -296,6 +360,10 @@ fn real_main() -> Result<()> {
             ToolchainCmd::Install { tool, version } => view::toolchain_install(&paths, &tool, version.as_deref()),
             ToolchainCmd::Remove { name } => view::toolchain_remove(&paths, &name),
         },
+        Cmd::Binary { cmd } => match cmd {
+            BinaryCmd::Keygen { dir } => binary::keygen(&dir),
+            BinaryCmd::Pack { packages, all, out, secret } => binary::pack(&paths, &packages, all, &out, &secret),
+        },
         Cmd::Doctor => view::doctor(&paths),
         Cmd::Env => {
             println!("export PATH=\"{}:$PATH\"", paths.bin().display());
@@ -319,6 +387,7 @@ impl From<BuildFlags> for Flags {
             sandbox: !f.insecure_no_sandbox,
             keep_build: f.keep_build,
             details: f.details,
+            binaries: !f.from_source,
         }
     }
 }

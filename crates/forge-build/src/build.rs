@@ -308,6 +308,8 @@ fn apply_deps(cfg: &BuildConfig, env: &mut Vec<(String, String)>) {
     // Headers of a dependency that ships no pkg-config file (header-only libraries like glaze) or
     // that a project includes without asking pkg-config for it (hyprlang.hpp).
     prepend_env(env, "CPATH", &join(each(&["include"])), ":");
+    // And their libraries at link time, for projects that say `-lname` without a pkg-config file.
+    prepend_env(env, "LIBRARY_PATH", &join(each(&["lib", "lib64"])), ":");
     prepend_env(env, "LD_LIBRARY_PATH", &join(each(&["lib", "lib64"])), ":");
 
     // Runtime search paths. CMake gets them through CMAKE_INSTALL_RPATH (it

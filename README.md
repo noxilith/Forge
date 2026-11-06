@@ -9,7 +9,7 @@ and can remove it again without leaving anything it installed behind.
 ```
 forge install niri foot            # by name, from the Forge package repository
 forge build https://github.com/fastfetch-cli/fastfetch   # any git link, no recipe needed
-forge sync                         # refresh the package repository
+forge sync                         # refresh the repository and check your packages for updates
 forge tap add <git-url> | list | update | remove <name>   # more repositories
 forge list | info <pkg> | verify [pkg]
 forge update <pkg> | upgrade
@@ -351,7 +351,7 @@ Besides a git `repo`, a recipe can name a release `archive` with a mandatory
 
 ```
 forge search hypr          # searches the repository, your recipes and other repositories
-forge sync                 # fetch newer recipes
+forge sync                 # fetch newer recipes, and list installed packages that have updates
 forge update <pkg> --refresh-recipe   # rebuild with the repository's current recipe
 forge tap add <git-url>    # another repository with the same layout
 ```

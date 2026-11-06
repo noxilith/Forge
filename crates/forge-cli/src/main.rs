@@ -50,7 +50,7 @@ enum Cmd {
         #[command(flatten)]
         flags: BuildFlags,
     },
-    /// Refresh the Forge package repository (and any other repositories you added).
+    /// Refresh the Forge package repository, then check the packages installed from it for updates.
     Sync,
     /// Build and install software from a git link or a local repository.
     Build {
@@ -217,7 +217,9 @@ fn real_main() -> Result<()> {
         }
         Cmd::Sync => {
             taps::ensure_default(&paths)?;
-            taps::update(&paths, None)
+            taps::update(&paths, None)?;
+            view::updates_report(&install::available_updates(&paths)?);
+            Ok(())
         }
         Cmd::Build { target, rev, name, recipe, build_system, ignore_repo, isolate, flags } => {
             if !ignore_repo && recipe.is_none() {

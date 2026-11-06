@@ -1580,3 +1580,37 @@ fn install_only_takes_names_and_points_links_to_build() {
     assert!(out.contains("hello"), "{out}");
     assert_eq!(run_bin(&f, "hello"), "hello-v1");
 }
+
+#[test]
+fn sync_refreshes_the_repository_and_reports_updates_for_installed_packages() {
+    let f = fixture("");
+    if !f.sandbox {
+        eprintln!("skipping: needs the sandbox");
+        return;
+    }
+    let (repo, envs) = archive_repo(&f);
+    let url = repo.to_str().unwrap().to_string();
+    let e: Vec<(&str, &str)> = envs.iter().map(|(k, v)| (*k, v.as_str())).chain([("FORGE_REPO", url.as_str())]).collect();
+    let run = |args: &[&str]| {
+        let o = f.forge_with(args, &e);
+        assert!(o.status.success(), "{args:?}: {}", String::from_utf8_lossy(&o.stderr));
+        String::from_utf8_lossy(&o.stdout).into_owned()
+    };
+    run(&["install", "greet"]);
+    let out = run(&["sync"]);
+    assert!(out.contains("up to date") && !out.contains("update(s) available"), "{out}");
+
+    // The repository publishes a new version of greet.
+    let file = repo.join("recipes/greet/recipe.toml");
+    let text = fs::read_to_string(&file).unwrap();
+    let old_sha = text.lines().find(|l| l.starts_with("sha256")).unwrap().to_string();
+    let new = text.replace("version = \"1.0\"", "version = \"1.1\"").replace(&old_sha, &format!("sha256 = \"{}\"", "ab".repeat(32)));
+    fs::write(&file, new).unwrap();
+    commit_all(&repo, "greet 1.1");
+
+    let out = run(&["sync"]);
+    assert!(out.contains("1 update(s) available") && out.contains("greet") && out.contains("1.1"), "{out}");
+    // Sync only checks: the installed version is untouched.
+    assert_eq!(run_bin(&f, "greet"), "patched");
+    assert!(run(&["list"]).contains("1.0"));
+}

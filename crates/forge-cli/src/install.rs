@@ -1144,3 +1144,45 @@ pub fn resolve_target(
         .unwrap_or_else(|| fetch::infer_name(&repo));
     Ok((repo, recipe, origin, name))
 }
+
+/// A package installed from the package repository that the repository now has a newer
+/// version of: `(name, installed version, available)`.
+pub struct Available {
+    pub name: String,
+    pub installed: String,
+    pub available: String,
+}
+
+/// Check the packages that came from the repository for updates. Packages built from a
+/// plain git link are left to `forge update`. Only checks; installs nothing.
+pub fn available_updates(paths: &Paths) -> Result<Vec<Available>> {
+    let mut out = Vec::new();
+    for m in Store::open(paths)?.list()? {
+        let Some(e) = taps::lookup(paths, &m.name)? else { continue };
+        if e.repo_norm.is_empty() || e.repo_norm != forge_core::util::normalize_repo_url(&m.repo) {
+            continue; // not from the repository
+        }
+        let p = &e.recipe.package;
+        if p.archive.is_some() {
+            if p.sha256.as_deref() != Some(m.commit.as_str()) {
+                out.push(Available { name: m.name.clone(), installed: m.version.clone(), available: p.version.clone().unwrap_or_else(|| "newer".into()) });
+            }
+            continue;
+        }
+        // Git source: the recipe may now name another revision, or the revision may have moved.
+        if p.rev.as_deref().is_some_and(|r| Some(r) != m.rev_spec.as_deref()) {
+            out.push(Available { name: m.name.clone(), installed: m.version.clone(), available: p.rev.clone().unwrap_or_default() });
+            continue;
+        }
+        let mirror = fetch::mirror_path(paths, &m.repo);
+        let spinner = ui::Spinner::start(&format!("check {}", m.name), true);
+        let res = fetch::sync_mirror(&mirror, &m.repo).and_then(|_| fetch::resolve(&mirror, m.rev_spec.as_deref()));
+        spinner.finish(res.is_ok(), "");
+        match res {
+            Ok(c) if c != m.commit => out.push(Available { name: m.name.clone(), installed: m.version.clone(), available: format!("{}", &c[..c.len().min(8)]) }),
+            Ok(_) => {}
+            Err(err) => eprintln!("{} could not check {}: {err:#}", ui::warn(), m.name),
+        }
+    }
+    Ok(out)
+}

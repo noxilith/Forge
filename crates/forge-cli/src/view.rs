@@ -463,3 +463,17 @@ pub fn remove_all(
     println!("  {}", ui::dim("Anything a program wrote outside Forge's directories is left alone."));
     Ok(())
 }
+
+/// The result of `forge sync`'s check on the installed packages.
+pub fn updates_report(av: &[crate::install::Available]) {
+    println!();
+    if av.is_empty() {
+        println!("  {} everything installed from the repository is up to date", ui::check());
+        return;
+    }
+    println!("  {} {} update(s) available", ui::bullet(), av.len());
+    for a in av {
+        println!("      {}  {} {} {}", ui::bold(&a.name), a.installed, ui::arrow(), a.available);
+    }
+    println!("  {}", ui::dim("install them with: forge upgrade --refresh-recipe"));
+}
